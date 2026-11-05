@@ -197,6 +197,80 @@ su -c 'cat /proc/droid_lkm/features'
 | `unshare --pid` | rc=1 `Invalid argument`（预期），且**不复位** |
 | **干净重启后**（uptime 204 s 起）start → 运行中 `stop` | **存活**（P1=13044，25 s 后 `p1_exists_after=no`，uptime 持续增长到 252 s，未复位） |
 
+### 7.1 浸泡测试（5 轮 start → 运行 180 s → stop）
+
+同一开机、同一模块实例，连续 5 轮。判据：`uptime` 必须单调递增（回退即视为复位），
+`/proc/modules` 全程保留 `droid_lkm`，每轮 `droidspaces check` 必须 rc=0。
+
+| 轮次 | uptime 起始 | 运行 180 s 后 | stop 之后 | 模块仍加载 | check |
+|---|---|---|---|---|---|
+| 1 | 870.03 | 1052.14 | 1066.96 | 1 | rc=0 `All required features found!` |
+| 2 | 1067.01 | 1249.12 | 1263.95 | 1 | rc=0 |
+| 3 | 1264.00 | 1446.10 | 1460.90 | 1 | rc=0 |
+| 4 | 1460.95 | 1643.06 | 1657.91 | 1 | rc=0 |
+| 5 | 1657.98 | 1840.10 | 1854.90 | 1 | rc=0 |
+
+**结果：5/5 通过。** `uptime` 全程单调递增（870 → 1854.9，无一次回退），
+`p1_exists_after=no` 每轮成立（容器干净退场），模块引用计数未泄漏。
+
+### 7.2 真实负载（systemd + 大量 fork + SysV IPC 全链路）
+
+容器以 **`--init=/sbin/init`（真 systemd）** 启动：`p1_comm=systemd`，启动日志
+`Booting 'UBUNTU26' (init: /sbin/init)`。
+
+| 项目 | 结果 |
+|---|---|
+| `apt list --installed` | **2101** 个包（大量 fork/exec，无异常） |
+| `apt-get update` | rc=0（镜像站不可达全为 `Ign`，但**进程链完整跑完且不复位**） |
+| `unshare --pid --fork`（容器内） | rc=0（模块的 `unshare=97` slot 钩子接管，不建真实 ns） |
+| `unshare --ipc`（容器内） | rc=0 |
+| 期间 uptime | 1929.47 → 2047.81 → 2071.15（单调递增，无复位） |
+
+SysV IPC 全链路（容器内，实测输出原文）：
+
+```
+$ ipcmk -M 4096          -> Shared memory id: 0   (rc=0)
+$ ipcs -m
+------ Shared Memory Segments --------
+key        shmid      owner      perms      bytes      nattch     status
+0x0d449356 0          root       644        4096       0
+$ ipcrm -m 0             -> rc=0
+$ ipcs -m                -> 只有表头（已删除）
+
+$ ipcmk -S 1             -> Semaphore id: 0
+$ ipcs -s                -> 0x1710c010 0 root 644 1
+$ ipcrm -s 0             -> 已删除（仅表头）
+
+$ ipcmk -Q               -> Message queue id: 0
+$ ipcs -q                -> 0x8cdfc595 0 root 644 0 0
+$ ipcrm -q 0             -> 已删除（仅表头）
+```
+
+宿主侧隔离校验（模块把表项留在容器自己的 ns 里）：
+
+```
+/proc/sysvipc/msg: 1     # 只有表头
+/proc/sysvipc/shm: 1
+/proc/sysvipc/sem: 1
+```
+
+期间 uptime 2286.23 → 2326.42，**无复位**。
+
+### 7.3 `/proc/self/ns` 缺 `pid` / `ipc` 条目的定性
+
+容器内 `/proc/1/ns` 与 `/proc/self/ns` 都只有
+`cgroup / mnt / net / time / time_for_children / uts`；**宿主侧 `/proc/self/ns` 同样没有 `pid` 与 `ipc`**。
+即这是**内核本身没有这两个 ns 的 procfs 条目**（`CONFIG_PID_NS=n`，且本机未编译 IPC namespace），
+不是模块"忘了挂"。模块只能伪造 ns 对象与 syscall 行为，**无法凭空造出 procfs 软链**。
+
+实际影响评估（已实测）：
+
+- `droidspaces check`：**不受影响**，PID namespace / IPC namespace 两项均 `✓`，rc=0；
+- 容器实际使用：systemd、`apt`（2101 包）、`ipcs`/`ipcmk`/`ipcrm` 全链路均正常；
+- 唯一受影响的是**依赖 `/proc/<pid>/ns/pid` 或 `.../ipc` 软链的工具**（部分 `nsenter`/`lsns` 写法、按软链判断隔离的脚本）。
+
+结论：**保持现状，不硬改**（在 `#10 已知限制` 中明确标注）。
+
 ---
 
 ## 8. 踩雷清单（现象 / 根因 / 改法 / 验证）
@@ -227,6 +301,8 @@ su -c 'cat /proc/droid_lkm/features'
 | 22 | `unshare --pid` 返回 `Invalid argument` | `CONFIG_PID_NS=n` 的预期行为 | 作为**通过**判据（且不得复位） |
 | 23 | 模块落盘到 `/data/adb/modules/` 后重启，`service.sh` 完全没执行（日志文件都不存在） | 本机内核侧 KSU UAPI=0，`ksud` 的 `late-load` 段直接失败，模块脚本执行链整体不工作 | 提权后手动/脚本 `insmod`（见 5.4）；另放 `service.d` 兜底 |
 | 24 | `adb shell 'su -c "cmd1; cmd2"'` 里第二条命令掉回 `shell` 域（`/proc/self/attr/current` = `u:r:shell:s0`，且报 `Permission denied`） | adb shell 传参 + 多层引号被外层 shell 提前切分 | 一条 `adb shell` 只放**一条** `su -c` 命令，或把逻辑写成 `.sh` push 到设备执行 |
+| 25 | `stop` 后立刻 `start` 报 `another operation is in progress on this container` | droidspaces 的停止是异步收尾，前一次 stop 尚未完成 | 脚本里先 `sleep 15~20`，再用 `droidspaces -n <name> pid` 轮询确认，最多重试 60 s |
+| 26 | `ipcmk` 输出是 `Shared memory id: 0`（不是 `id=0`） | 解析正则假设错误，`ipcrm` 拿到空参数 → rc=1 | 从 `ipcs -m` 的第 2 列取真实 id 再 `ipcrm`；实测 id 恒为 0 |
 
 ---
 
@@ -236,10 +312,12 @@ su -c 'cat /proc/droid_lkm/features'
 
 1. 轮询 `adb devices`，等 `sys.boot_completed=1`；
 2. `su -c id` 失败 → 跑 `rpproot_re/reroot.sh`（无线 ADB token 提权，`--borno` 需 |Δt| ≤ 301 s）；
-3. 断点写入 `/data/local/tmp/auto_state`；
-4. 每轮把 `/data/local/tmp` 的 `kB*.log`、`state`、`ds_start/stop*.log` 拉回 `auto/logs/<轮次>/`。
+3. **`Ensure-Module`**：`/proc/modules` 里没有 `droid_lkm` 就自动 `insmod`（本机 KSU 不会开机加载，见 5.4）；
+4. 断点写入 `/data/local/tmp/auto_state`；
+5. 每轮把 `/data/local/tmp` 的 `kB*.log`、`state`、`ds_start/stop*.log` 拉回 `auto/logs/<轮次>/`。
 
-实测：复位→设备上线→自动提权→可继续测试，全程 **21 s**，无需人工。
+实测：复位→设备上线（uptime=22.25）→自动提权（`ROOT_RESTORED uid=0(root)`）→模块加载，
+全程 **22 s**，无需人工。**不使用一键 root BAT**（其内含分区写入，违反"不刷机 / 不写分区"约束）。
 
 ---
 
@@ -251,8 +329,11 @@ su -c 'cat /proc/droid_lkm/features'
    `/proc/<pid>/ns/*` 的 `readlink`/`open`/`setns` 会被拒（没有针对 `unlabeled_t` 的 allow 规则），
    `ls -l` 也显示权限拒绝；以 root/kernel 域运行的 Droidspaces 不受影响。若将来要让普通 App 读取，
    需要给 nsfs inode 打正确标签（`genfscon`/`sepolicy` 规则）。
-4. **`/proc/self/ns` 缺 `pid` 与 `ipc` 两个条目**：伪造的 ns 未挂接到 procfs 的 `ns` 目录；
-   依赖这两个软链的工具（如部分 `nsenter`/`lsns` 用法）会失败。
+4. **`/proc/self/ns` 缺 `pid` 与 `ipc` 两个条目**：**宿主内核本身就没有这两个 procfs 条目**
+   （`CONFIG_PID_NS=n`、未编译 IPC namespace），所以容器里同样不可能出现——不是模块漏挂，
+   模块也无法凭空造出 procfs 软链。实测影响：`droidspaces check` 仍 rc=0（两项都 `✓`），
+   systemd / `apt`（2101 包）/ `ipcs`/`ipcmk`/`ipcrm` 全部正常；只有依赖
+   `/proc/<pid>/ns/pid`、`.../ipc` 软链的工具（部分 `nsenter`/`lsns` 写法）会失败。**不硬改**。
 5. **`container.config` 每次重启退化**（488 B 全 NUL），启动前需修复；已在踩雷 #2 记录。
 6. **日志量大**：`BRxx` 面包屑按 B7 要求无条件打印，进程频繁退出时 kmsg 增长快。
 7. **仅在本机验证**：5.10.236 / dizi / `CONFIG_PID_NS=n` / `CONFIG_CFI_CLANG=y`；其他机型需重编并重跑同一套验收。
