@@ -448,6 +448,15 @@ stop 后 `droidspaces check` 仍是 `PID namespace ✓ / IPC namespace ✓ / All
 > （本机 `dmesg` 在 `u:r:ksu:s0` 下为空、`logcat` 缓冲为空、pstore 为空）。
 > 按事实记录：**偶发、未复现、已加稳定期** —— `insmod` 后等 3 s 再 check（最多重试 3 次），
 > 且 `round.ps1` 现在会先等 `su` 回到 root 域再采集（见踩雷 #35）。
+>
+> **取证路径盘点**：`ksud feature` 里能用的调试项只有 `sulog`（ID=2，SU 事件日志，**不记录内核崩溃**）
+> 和 `adb_root` 等，均不能替代 `dmesg`；而本机 `dmesg` 在 `u:r:ksu:s0` 下为空、`logcat` 缓冲为空、
+> pstore 为空，所以**没有抓到 fake ns create 的失败返回**（`-EINVAL` / `-ENOMEM` / `layout not trusted`）。
+>
+> **另一次未归因复位**：约 06:37:30（`su_compat=0`、容器已 stop 后重跑 `reroot.sh` 期间），设备复位；
+> `persist.sys.boot.reason` 历史记为 `reboot`（**没有 `shell` 标记**，与 `adb reboot` 的 `reboot,shell` 可区分）。
+> 其后 3 轮 `reroot.sh` + 3 次 `adb reboot` 全部正常，**未再现**；`reroot.sh` 内无 `reboot` 调用，无法归因，不做猜测。
+
 
 
 ### 7.7 容器内真实安装并执行（apt + ipcs + unshare）
