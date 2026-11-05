@@ -20,45 +20,59 @@ function Log([string]$m) {
 }
 
 function Wait-Device([int]$timeout) {
+    # 不等 boot_completed：adb 一上线就开始提权，能省下 20-40 s；
+    # 提权本身有重试（Ensure-Root），系统没起好时会自动再试。
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalSeconds -lt $timeout) {
         $dev = (& $adb devices 2>$null) -join "`n"
         if ($dev -match "`tdevice") {
+            $up = ((& $adb shell cat /proc/uptime 2>$null) -join "").Trim()
             $bc = ((& $adb shell getprop sys.boot_completed 2>$null) -join "").Trim()
-            if ($bc -eq "1") {
-                $up = ((& $adb shell cat /proc/uptime 2>$null) -join "").Trim()
-                Log "device online boot_completed=1 uptime=$up"
-                return $true
-            }
+            Log "device online uptime=$up boot_completed=$bc"
+            return $true
         }
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds 2
     }
     Log "WAIT_DEVICE_TIMEOUT"
     return $false
 }
 
 function Ensure-Root {
-    $id = ((& $adb shell "su -c id" 2>$null) -join "").Trim()
-    if ($id -match "uid=0") { Log "ROOT_OK $id"; return $true }
+    for ($try = 0; $try -lt 5; $try++) {
+        $id = ((& $adb shell "su -c id" 2>$null) -join "").Trim()
+        if ($id -match "uid=0") { Log "ROOT_OK $id"; return $true }
 
-    Log "NO_ROOT -> reroot.sh"
-    $r = ((& $adb shell "sh /data/local/tmp/rpproot_re/reroot.sh" 2>&1) -join "`n")
-    $r -split "`n" | Select-Object -Last 8 | ForEach-Object { Log "reroot| $_" }
-    Start-Sleep -Seconds 3
+        Log "NO_ROOT -> reroot.sh try=$try"
+        $r = ((& $adb shell "sh /data/local/tmp/rpproot_re/reroot.sh" 2>&1) -join "`n")
+        $r -split "`n" | Select-Object -Last 6 | ForEach-Object { if ($_.Trim()) { Log "reroot| $_" } }
+        Start-Sleep -Seconds 5
 
-    $id2 = ((& $adb shell "su -c id" 2>$null) -join "").Trim()
-    if ($id2 -match "uid=0") { Log "ROOT_RESTORED $id2"; return $true }
+        $id2 = ((& $adb shell "su -c id" 2>$null) -join "").Trim()
+        if ($id2 -match "uid=0") { Log "ROOT_RESTORED $id2"; return $true }
+        Log "REROOT_RETRY_FAILED try=$try"
+        Start-Sleep -Seconds 10
+    }
     Log "REROOT_FAILED"
     return $false
 }
 
 function Ensure-KSU {
     # 本机是 "先提权，再 late-load"：开机阶段 KSU 还没加载，post-fs-data/service 已过。
-    # ksu_bringup.sh：late-load（若未加载）+ 补触发 service 阶段（让 module service.sh 自己跑 insmod）
-    & $adb push (Join-Path $root "ksu_bringup.sh") /data/local/tmp/ksu_bringup_v2.sh 2>&1 | Out-Null
-    $r = ((& $adb shell "su -c 'sh /data/local/tmp/ksu_bringup_v2.sh'" 2>&1) -join "`n")
-    $r -split "`n" | ForEach-Object { if ($_.Trim()) { Log "ksubring| $_" } }
-    if ($r -match "KSU_UP") { Log "KSU_UP"; return $true }
+    # 关键：late-load 必须用**独立的一次** su 命令直接执行；若包在脚本里跑，
+    # 会把该 su 会话掉进 shell 域，并且下一次 su 会阻塞 ~3 分钟（实测）。
+    $k = ((& $adb shell "grep -c kernelsu /proc/modules" 2>$null) -join "").Trim()
+    if ($k -ne "1") {
+        Log "KSU_KERNEL_ABSENT -> late-load"
+        & $adb shell "su -c '/data/local/tmp/libksud.so late-load --allow-shell --package-name me.weishu.kernelsu'" 2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+    } else {
+        Log "KSU_KERNEL_PRESENT"
+    }
+
+    & $adb push (Join-Path $root "ksu_boot.sh") /data/local/tmp/ksu_boot_v1.sh 2>&1 | Out-Null
+    $r2 = ((& $adb shell "su -c 'sh /data/local/tmp/ksu_boot_v1.sh'" 2>&1) -join "`n")
+    $r2 -split "`n" | ForEach-Object { if ($_.Trim()) { Log "ksu-boot| $_" } }
+    if ($r2 -match "KSU_UP") { Log "KSU_UP"; return $true }
     Log "KSU_BRINGUP_FAILED"
     return $false
 }
@@ -110,7 +124,22 @@ Ensure-KSU | Out-Null
 $mK = ((& $adb shell "grep -c droid_lkm /proc/modules" 2>$null) -join "").Trim()
 Log "MODULE_AFTER_KSU_LOADED=$mK"
 Ensure-Module | Out-Null
-$chk = ((& $adb shell "su -c '/data/local/Droidspaces/bin/droidspaces check'" 2>&1) -join "`n")
-if ($chk -match "All required features") { Log "CHECK_OK" } else { Log "CHECK_FAILED" }
+Start-Sleep -Seconds 3
+$chk = ""
+for ($i = 0; $i -lt 3; $i++) {
+    $chk = ((& $adb shell "su -c '/data/local/Droidspaces/bin/droidspaces check'" 2>&1) -join "`n")
+    if ($chk -match "All required features") { break }
+    Log "CHECK_RETRY=$i"
+    Start-Sleep -Seconds 2
+}
+if ($chk -match "All required features") { Log "CHECK_OK" } else {
+    Log "CHECK_FAILED"
+    $chk | Out-File -Encoding utf8 (Join-Path $logDir "check_failed.txt")
+    $cross = [string][char]0x2717
+    $miss = $chk -split "`n" | Where-Object { $_.Contains($cross) }
+    foreach ($line in $miss) { Log ("check-miss: " + ($line -replace '\x1b\[[0-9;]*m','')) }
+    $dm = ((& $adb shell "su -c 'dmesg | tail -20'" 2>&1) -join "`n")
+    $dm | Out-File -Encoding utf8 (Join-Path $logDir "dmesg_check_failed.txt")
+}
 Pull-Files $Round
 Log "round $Round finished elapsed=$([math]::Round($sw.Elapsed.TotalSeconds,1))s"
