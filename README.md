@@ -20,6 +20,8 @@
 | 崩溃前最后一条面包屑（B15） | **`BR05 reaper_swap done`**，随后 `STALL enter point=3` 之后再无输出 |
 | 复位的直接触发点 | `droid_lkm_ks.disable_pid_allocation(ns)` 的**间接调用**（B17：跳过它 → kill/stop 全存活） |
 | 修复后验收 | 运行中 `stop` 连续 2 次不复位；`kill -KILL` PID1 不复位；`droidspaces check` 全绿；SysV IPC 三类通过；`unshare --pid` 返回 EINVAL 且不复位 |
+| `insmod` 后 check 短暂 ✗ | **确定性、非故障**：模块先以 `Loading`（970752 B）出现，期间 PID/IPC 两项必 ✗；**3–7 s** 后转 `Live`（786432 B）自动恢复（3/3 轮实测） |
+| App（Droidspaces UI）能否用 | **能**：KSU `su_compat=1` + `com.droidspaces.app` 在 `.allowlist`（真实 appId **10330**）→ App 内启停容器成功 |
 
 ---
 
@@ -249,17 +251,36 @@ adb reboot
 
 恢复：重新 `ksud module install` + `merge_module.sh` + 重启（本仓库最后一轮即按此恢复，check 全绿）。
 
-### 5.6 App 界面：本机不可用的原因（重要）
+### 5.6 App 界面：可以用了（`su_compat`，实测）
 
-本机 root 是**临时 root（exploit）**，不是"开机动 KernelSU"：
+先说结论：**本机不刷 boot 也能让 Droidspaces App 拿到 root。** 关键是 KernelSU 的
+`su_compat` 特性（本机 KSU 3.3.0 默认就是开启的）。
 
-- App 点击容器页会提示 **"无法获取 Root 权限，此页面已被禁用"**（不是"内核不支持"）。
-- 根因：临时 root 的 `su` 守护进程只认 shell（uid 2000）。实测以应用 uid 调用：
-  `setuidgid 10123 /system/xbin/su -c id` → 无输出、`rc=111`；以 shell uid 调用则正常返回 `uid=0`。
-- KernelSU 自己的 `su` 确实存在（`/data/adb/ksu/bin/su` 是 `ksud` 的软链，`su -v` 输出 `3.3.0:KernelSU`），
-  但 `/data/adb` 是 0700，且本机没有 `/system/bin/su`（late-load 不会补这个挂载），应用无法执行到它。
-- 结论：**App 路径需要"开机即加载 KernelSU"的 root 方案**（刷 boot / 官方 KSU 安装），
-  本机在不写分区的前提下做不到。日用请走 CLI（`droidspaces ...`），功能完全等价。
+- 查看：`ksud feature get su_compat` → `Value: 1  Status: enabled`；
+  开关：`ksud feature set su_compat 0|1`（**立即生效，不需要重启**）。
+- 开启时 KSU 提供 `/system/bin/su`（4,892,712 B，`su -v` = `3.3.0:KernelSU`）。
+- App 必须已在 KSU 授权名单：`/data/adb/ksu/.allowlist` 里要有 `com.droidspaces.app`。
+- **App 的真实 appId 是 10330**（`dumpsys package com.droidspaces.app` → `appId=10330`）。
+  不要用别的 uid 去测：su_compat 对**未授权 uid** 会把 `su` 隐藏，执行结果是 ENOENT，
+  很容易误判成"su 不可用"。
+
+实测（root 会话里用 `busybox setuidgid` 模拟 App uid）：
+
+| `su_compat` | App uid 10330 执行 `/system/bin/su -c id` | 结论 |
+|---|---|---|
+| 1（enabled） | `uid=0(root) gid=0(root) … context=u:r:ksu:s0` | App 可提权 |
+| 0（disabled） | `setuidgid: can't execute '/system/bin/su': No such file or directory` | App 失去 root |
+
+App 侧实测（两次，跨重启复验）：
+
+- 容器页**不再**出现"无法获取 Root 权限，此页面已被禁用"；
+- 点「启动」输出 `Command executed (exit code: 0)` / `操作成功！`，
+  `Container started with PID 28916`（首次）/ `PID 17775`（重启后复验），Ubuntu 26.04 正常启动；
+- 随后 CLI `stop` 返回 `Container stopped.`，uptime 单调递增、设备不复位。
+
+> 本节早期版本写"必须刷 boot"是**错的**：当时用 uid 10123（不是 Droidspaces 的 appId）测，
+> 也未核对 `su_compat` 与 `.allowlist`。已用真实 appId 10330 复核，并在 App 内实机启动容器两次。
+
 
 ## 6. 回滚
 
@@ -411,10 +432,23 @@ stop 后 `droidspaces check` 仍是 `PID namespace ✓ / IPC namespace ✓ / All
   "90 秒内"这个目标，本机受限于 USB/adb 上线时间，实测 **95–101 s**；
   若按"adb 上线 → 全绿"计，则稳定 **< 35 s**。
 
-> 异常记录（1/7 轮）：cycle7 的 `droidspaces check` 连续 3 次报 ✗，约 23 s 后设备自行复位
-> （`ro.boot.bootreason=reboot`，pstore 空）。复位后同一套 round 流程 35.7 s 恢复到 check 全绿；
-> 该异常在 cycle8/9/10 未复现。**怀疑与"late-load 刚完成就立刻 insmod + check"的时序有关**，
-> 已把 `service.sh` 后加 3 s 稳定期 + check 最多重试 3 次，仍保留该记录备查。
+> **cycle7 异常复核（本轮 3 轮真实重启，逐 3 s 采样 insmod 后 0–45 s）**
+>
+> | 轮次 | 模块出现 uptime | 模块状态 | t=0 | t=3 | t=6 | 复位 |
+> |---|---|---|---|---|---|---|
+> | c1 | 30.45 | `Loading` 970752 B | ✗ 9（PID/IPC 两项 required） | ✗ 9 | ✗ 6（仅 optional） | 无 |
+> | c2 | 32.67 | `Loading` 970752 B | ✗ 9 | ✗ 9 | ✗ 6 | 无 |
+> | c3b | 36.17 | `Loading` 970752 B | ✗ 9 | ✗ 6 | ✗ 6 | 无 |
+>
+> 结论：**"check 连续 ✗"是模块 init 未完成的确定性窗口，不是故障本身。** `insmod` 返回后模块
+> 先以 `Loading`（970752 B）出现，此时 `/proc/droid_lkm/features` 为空、PID/IPC 两项必 ✗；
+> 约 **3–7 s** 后转 `Live`（786432 B），check 自动回到 required 全绿。
+>
+> 但 **"约 23 s 后自复位"在 3/3 轮刻意复现中都没有出现**，也没抓到 fake ns create 的失败返回
+> （本机 `dmesg` 在 `u:r:ksu:s0` 下为空、`logcat` 缓冲为空、pstore 为空）。
+> 按事实记录：**偶发、未复现、已加稳定期** —— `insmod` 后等 3 s 再 check（最多重试 3 次），
+> 且 `round.ps1` 现在会先等 `su` 回到 root 域再采集（见踩雷 #35）。
+
 
 ### 7.7 容器内真实安装并执行（apt + ipcs + unshare）
 
@@ -435,11 +469,32 @@ unshare --ipc true               # rc=0
 期间宿主 uptime 707.24 → 707.49（单调递增）；随后 `droidspaces stop` 返回
 `Container stopped.`，12 s 后 uptime 仍增长、`droidspaces check` 全绿 → **停容器不复位**。
 
-### 7.8 App 界面演练结论
+### 7.8 App 界面演练结论（已改判：可用）
 
-按 5.6：App 在容器页报 **"无法获取 Root 权限，此页面已被禁用"**，因此 App UI 无法启动/停止容器。
-这不是模块的问题，而是本机 **临时 root 的 `su` 不给应用 uid**。
-`droidspaces check`/CLI 全绿，容器可正常启停；App 路径需"开机即 KernelSU"的 root 方案。
+见 5.6。App（真实 appId **10330**）通过 KSU `su_compat` 拿到 root：
+
+- 容器页不再显示"无法获取 Root 权限，此页面已被禁用"；
+- App 内点「启动」成功：`Container started with PID 28916`（首次）/ `PID 17775`（重启后复验），
+  `Command executed (exit code: 0)` + `操作成功！`；
+- 随后 CLI `stop` → `Container stopped.`，uptime 169→268 单调递增，设备不复位。
+
+**App 路径不再需要刷 boot**；前提只有两个：`su_compat=1`、`com.droidspaces.app` 在 `.allowlist`。
+
+### 7.9 `su_compat` 开关验证（立即生效 / 对模块无影响）
+
+同一次开机内来回切换（uptime 169.70 → 268.65 单调，无重启）：
+
+| 状态 | `/system/bin/su` | App uid 10330 → `su -c id` | `droidspaces check` | 容器 start/stop | `droid_lkm` |
+|---|---|---|---|---|---|
+| `su_compat=0` | 不存在 | `can't execute … No such file or directory` | required 全绿 | 正常，不复位 | Live，refcnt 2 |
+| `su_compat=1` | 存在（4,892,712 B） | `uid=0(root)` | required 全绿 | 正常，不复位 | Live，refcnt 2 |
+
+- **生效方式：立即**。`ksud feature set` 返回后 `ls /system/bin/su` 立刻出现/消失，不需要重启。
+- **持久化**：值写入 `/data/adb/ksu/.feature_config`；本轮 3 次重启后 `feature get` 均为 `1`。
+- **对 `droid_lkm` 无影响**：两种状态下 check 全绿、容器起停正常、模块一直 `Live`。
+- **副作用**：`su_compat=0` 会让 shell 也失去 `su`（本机 root 直接断）。
+  必须在**同一个 root 会话**里完成"关闭 → 测试 → 重开"，否则要重跑 `reroot.sh` 再开回来（见踩雷 #36）。
+
 
 ---
 
@@ -480,7 +535,11 @@ unshare --ipc true               # rc=0
 | 31 | `ksud module install` 成功，但 `insmod` 报 `Exec format error` | 落盘的 ko 变成 **10 MB 全零**（sha256 与源不一致） | 装完必须 `sha256sum`；不一致就重装一次（实测重装即恢复） |
 | 32 | 装到 `modules_update` 后重启，`/data/adb/modules/<id>` 没更新 | KSU 的 merge 在开机阶段跑；本机是 late-load，阶段早过了 | `merge_module.sh` 手工合并 + 删 `update` 标记（见 5.1） |
 | 33 | late-load 后同一脚本里 `date`/`sleep` 报 `inaccessible or not found`，日志 `Permission denied`；下一次 `su` 卡 ~175 s | late-load 会把**当前 su 会话**掉进 shell 域；包在脚本里跑还会让下一个 su 阻塞 | late-load 必须用**独立的一次** `su -c '<libksud.so> late-load ...'` 直接执行，后续操作另起一次 `su`（见 5.4.3） |
-| 34 | App 容器页提示"无法获取 Root 权限，此页面已被禁用" | 临时 root 的 `su` 守护只认 shell uid（app uid 调用 rc=111）；KSU 的 su 在 0700 的 `/data/adb` 下，应用执行不到 | 日用走 CLI；要 App 可用需"开机即 KernelSU"的 root（需刷 boot，本机约束下不做），见 5.6 |
+| 34 | App 容器页提示"无法获取 Root 权限，此页面已被禁用" | 当时测错 uid（10123 ≠ Droidspaces 的 `appId=10330`）；su_compat 对未授权 uid 隐藏 `su`（ENOENT） | 用 `dumpsys package` 取真实 appId；确认 `su_compat=1` + `.allowlist` 含包名，即可用（见 5.6） |
+| 35 | late-load 刚完成就执行 `su -c`，脚本里 `sleep`/`cut` 报 `inaccessible or not found`、写日志 `Permission denied`，`su` 报 `Text file busy` | late-load 后 su 会话/二进制有一小段竞态，会短暂掉回 shell 域 | 采集前先轮询 `su -c 'id -u'` == 0（本轮 `cycle_watch.ps1` 最多 10 次、每次 3 s），再跑采样脚本 |
+| 36 | `ksud feature set su_compat 0` 之后，下一条 `su -c ...` 直接报 `su: inaccessible or not found`，再也开不回来 | su_compat 关闭会**立即**移除 `/system/bin/su`（连 shell 也没有），形成"锁死" | 关闭/测试/重开必须在**同一个 root 会话**里做（`su -c 'set 0; test; set 1'`）；已锁死则跑 `reroot.sh` 拿临时 root 再 `set 1` |
+| 37 | `dumpsys package` 查到的 `userId` 与实际 `appId` 在两个字段 | `appId` 才是进程 uid（本机 `appId=10330`），`userId` 可能相同也可能不同 | 一律以 `appId=` 为准；不要用猜的 uid 做能力测试 |
+
 
 ---
 
@@ -520,8 +579,10 @@ unshare --ipc true               # rc=0
 5. **`container.config` 每次重启退化**（488 B 全 NUL），启动前需修复；已在踩雷 #2 记录。
 6. **日志量大**：`BRxx` 面包屑按 B7 要求无条件打印，进程频繁退出时 kmsg 增长快。
 7. **仅在本机验证**：5.10.236 / dizi / `CONFIG_PID_NS=n` / `CONFIG_CFI_CLANG=y`；其他机型需重编并重跑同一套验收。
-8. **App（Droidspaces UI）不可用**：本机临时 root 的 `su` 只给 shell uid，应用拿不到 root；
-   CLI/`droidspaces check` 完全等价可用。要 App 可用必须"开机即 KernelSU"（刷 boot，超出本机约束）。
+8. **App 可用，但依赖两个前提**：Droidspaces App（真实 `appId=10330`）需要
+   `su_compat=1` **且** `com.droidspaces.app` 在 `/data/adb/ksu/.allowlist`；
+   两者满足时 App 内可正常启停容器（见 5.6 / 7.8 / 7.9）。
+   若把 `su_compat` 关掉，App 会回到"无法获取 Root 权限，此页面已被禁用"，而 CLI 不受影响。
 
 ---
 
@@ -531,6 +592,8 @@ unshare --ipc true               # rc=0
 - 日常操作走 CLI：`droidspaces -n UBUNTU26 start --init=/sbin/init` / `stop` / `run -- <cmd>`；
 - 容器内第一次 `apt`/联网失败，先看 `/etc/resolv.conf`（本机 1.1.1.1/8.8.8.8 不可达，改成 223.5.5.5 / 114.114.114.114）；
 - 想彻底关闭补丁：删 `/data/adb/modules/droidspaces_shim` + 重启（见 5.5）；
+- 想用 App（而不只是 CLI）：先确认 `ksud feature get su_compat` 为 `1`（默认就是），
+  且 `com.droidspaces.app` 在 `.allowlist`；**不要随手关 `su_compat`**，它一关 shell 与 App 同时失去 root；
 - 升级模块：`ksud module install` → `merge_module.sh` → 重启（不要只覆盖 ko，`update` 标记会导致不合并）。
 
 ### 关于 `pid_cachep`（改进 C 的取舍）
