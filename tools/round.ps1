@@ -72,6 +72,19 @@ function Ensure-KSU {
     & $adb push (Join-Path $root "ksu_boot.sh") /data/local/tmp/ksu_boot_v1.sh 2>&1 | Out-Null
     $r2 = ((& $adb shell "su -c 'sh /data/local/tmp/ksu_boot_v1.sh'" 2>&1) -join "`n")
     $r2 -split "`n" | ForEach-Object { if ($_.Trim()) { Log "ksu-boot| $_" } }
+
+    # su_compat 必须在 late-load 之后补到 1：否则 App 打开即“页面被禁用”，
+    # 且 shell 的 su 也会一起消失。ksu_boot.sh 已内置这步，这里再兜一层（防旧脚本）。
+    $sc = ((& $adb shell "su -c '/data/adb/ksu/bin/ksud feature get su_compat'" 2>&1) -join "`n")
+    if ($sc -notmatch "Value:\s*1") {
+        Log "SU_COMPAT_NOT_1 -> set 1"
+        & $adb shell "su -c '/data/adb/ksu/bin/ksud feature set su_compat 1'" 2>&1 | Out-Null
+        $sc = ((& $adb shell "su -c '/data/adb/ksu/bin/ksud feature get su_compat'" 2>&1) -join "`n")
+        Log ("SU_COMPAT_AFTER=" + ($sc -replace "`n", " "))
+    } else {
+        Log "SU_COMPAT_OK"
+    }
+
     if ($r2 -match "KSU_UP") { Log "KSU_UP"; return $true }
     Log "KSU_BRINGUP_FAILED"
     return $false

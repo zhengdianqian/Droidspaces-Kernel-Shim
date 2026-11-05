@@ -12,6 +12,22 @@ if ! grep -q '^kernelsu ' /proc/modules 2>/dev/null; then
 	exit 3
 fi
 
+# su_compat=0 时 /system/bin/su 会整体消失（App 与 shell 都拿不到 root）。
+# 这里在 late-load 之后、模块服务之前把它补齐（立即生效，无需重启）。
+KSUD=/data/adb/ksu/bin/ksud
+if [ -x "$KSUD" ]; then
+	V=$("$KSUD" feature get su_compat 2>/dev/null | grep '^Value:' | awk '{print $2}')
+	if [ "$V" = "0" ]; then
+		log "SU_COMPAT_OFF -> enable"
+		"$KSUD" feature set su_compat 1 >> $OUT 2>&1
+		log "SU_COMPAT_SET_RC=$?"
+	else
+		log "SU_COMPAT_OK=${V:-unknown}"
+	fi
+else
+	log "KSUD_MISSING"
+fi
+
 MOD=/data/adb/modules/droidspaces_shim
 if [ -x "$MOD/service.sh" ]; then
 	log "MODULE_SERVICE_BEGIN"

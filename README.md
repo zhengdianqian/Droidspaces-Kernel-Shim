@@ -211,8 +211,14 @@ su -c 'cat /proc/droid_lkm/features'
 
 ```
 1) su -c '/data/local/tmp/libksud.so late-load --allow-shell --package-name me.weishu.kernelsu'
-2) su -c 'sh /data/local/tmp/ksu_boot_v1.sh'     # 内部执行模块 service.sh，然后打印 KSU_UP
+2) su -c 'sh /data/local/tmp/ksu_boot_v1.sh'
+   # 内部顺序：su_compat 自查（0 → set 1）→ 模块 service.sh（insmod）→ 打印 KSU_UP
 ```
+
+`ksu_boot_v1.sh` 现在会**先把 `su_compat` 补到 1** 再跑模块：否则如果上次是 0 状态，
+重启后 App 一打开就是"页面被禁用"，而且 shell 的 `su` 也会一起消失。切换是立即生效的，
+不需要额外重启（见 7.9）。这一步同时内置在 `ksu_boot.sh` 与 `ksu_bringup.sh boot` 里，
+`round.ps1` 在 `KSU_UP` 之后再兜底检查一次（`SU_COMPAT_NOT_1 -> set 1`）。
 
 为什么必须拆开（本机实测）：
 
@@ -222,6 +228,12 @@ su -c 'cat /proc/droid_lkm/features'
   改成"独立一次 su 直接执行 late-load"后，下一次 su 立即返回（实测 3 s）。
 
 `service.sh` 自己会做 `uname -r` 逐字节比对、`sha256` 校验、`insmod`、自检。
+
+**验收（故意把 `su_compat` 预置成 0 后重启）**：`round.ps1` 日志出现
+`SU_COMPAT_NOT_1 -> set 1` → `SU_COMPAT_AFTER=… Value: 1 Status: enabled`，
+随后 `CHECK_OK`（`All required features found!`）；重启后打开 App，容器页直接可用
+（无"无法获取 Root 权限，此页面已被禁用"），「启动」按钮正常显示。
+
 
 实测（连续三轮真实重启，宿主时钟）：
 
@@ -258,6 +270,10 @@ adb reboot
 
 - 查看：`ksud feature get su_compat` → `Value: 1  Status: enabled`；
   开关：`ksud feature set su_compat 0|1`（**立即生效，不需要重启**）。
+- **开机流程已自动补到 1**：`ksu_boot.sh` / `ksu_bringup.sh boot` 在 late-load 之后先做
+  `su_compat` 自查（0 → 1），`round.ps1` 再兜底检查一次（见 5.4.3 / §9）。
+- **关闭的副作用（重要）**：`su_compat=0` 会让 `/system/bin/su` 整体消失，**连 shell 的 `su` 也没了**；
+  必须在**同一个 root 会话**里完成"关闭 → 测试 → 重开"，否则会锁死（只能 `reroot.sh` 拿临时 root 再开回来，见踩雷 #36）。
 - 开启时 KSU 提供 `/system/bin/su`（4,892,712 B，`su -v` = `3.3.0:KernelSU`）。
 - App 必须已在 KSU 授权名单：`/data/adb/ksu/.allowlist` 里要有 `com.droidspaces.app`。
 - **App 的真实 appId 是 10330**（`dumpsys package com.droidspaces.app` → `appId=10330`）。
@@ -453,9 +469,15 @@ stop 后 `droidspaces check` 仍是 `PID namespace ✓ / IPC namespace ✓ / All
 > 和 `adb_root` 等，均不能替代 `dmesg`；而本机 `dmesg` 在 `u:r:ksu:s0` 下为空、`logcat` 缓冲为空、
 > pstore 为空，所以**没有抓到 fake ns create 的失败返回**（`-EINVAL` / `-ENOMEM` / `layout not trusted`）。
 >
-> **另一次未归因复位**：约 06:37:30（`su_compat=0`、容器已 stop 后重跑 `reroot.sh` 期间），设备复位；
-> `persist.sys.boot.reason` 历史记为 `reboot`（**没有 `shell` 标记**，与 `adb reboot` 的 `reboot,shell` 可区分）。
-> 其后 3 轮 `reroot.sh` + 3 次 `adb reboot` 全部正常，**未再现**；`reroot.sh` 内无 `reboot` 调用，无法归因，不做猜测。
+> **未归因复位的相关性观察（2/2 vs 0/5）**
+>
+> - 第 1 次：06:37:30，`su_compat=0`、容器 stop 后跑 `reroot.sh` → 复位（`boot.reason` 历史 `reboot`，无 `shell` 标记）；
+> - 第 2 次：07:01:23，同样的前置（`su_compat=0` + `reroot.sh`）→ 又一次复位（`reboot`，同样无 `shell` 标记）；
+> - 对照：`su_compat=1` 下 `reroot.sh` 跑了 5 次（3 轮 cycle + 2 次浸泡前准备）全部正常，`adb reboot` 均为 `reboot,shell`。
+>
+> 即：**"`su_compat=0` 时跑 `reroot.sh`" 到目前为止 2/2 复位，`su_compat=1` 时 0/5**。
+> `reroot.sh` 内没有 `reboot` 调用，根因仍未定位（不作猜测）；当前流程已把 `su_compat` 在开机后第一时间补到 1，
+> 这条路径在实际使用中不会再出现。若将来仍要复现，按此法对照即可。
 
 
 
@@ -559,7 +581,8 @@ unshare --ipc true               # rc=0
 1. 轮询 `adb devices`（**不等 `boot_completed`**，一上线就开始，最多省 ~30 s；提权失败会自动重试 5 次）；
 2. `su -c id` 失败 → 跑 `rpproot_re/reroot.sh`（无线 ADB token 提权，`--borno` 需 |Δt| ≤ 301 s）；
 3. **`Ensure-KSU`**：先看 `/proc/modules` 是否有 `kernelsu`；没有就用**独立一次** `su` 直接 `libksud.so late-load`，
-   然后另起一次 `su` 跑 `ksu_boot.sh`（内部执行模块 `service.sh`，模块自己 `insmod`）；
+   然后另起一次 `su` 跑 `ksu_boot.sh`（内部顺序：**`su_compat` 0 → 1** → 模块 `service.sh` 自己 `insmod`）；
+   `round.ps1` 之后还会再查一次 `ksud feature get su_compat`，不是 1 就补成 1；
 4. **`Ensure-Module`**：兜底，`/proc/modules` 里仍没有 `droid_lkm` 才直接 `insmod`；
 5. 等 3 s，`droidspaces check` 断言 `All required features`（最多重试 3 次）；
 6. 断点写入 `/data/local/tmp/auto_state`；

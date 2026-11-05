@@ -58,6 +58,19 @@ do_boot() {
 		return 3
 	fi
 
+	# su_compat=0 会让 /system/bin/su 整体消失（App 与 shell 同时失去 root）。
+	# late-load 成功后立即补回；切换是立即生效的，不需要再重启。
+	if [ -x "$K" ]; then
+		V=$("$K" feature get su_compat 2>/dev/null | grep '^Value:' | awk '{print $2}')
+		if [ "$V" = "0" ]; then
+			log "SU_COMPAT_OFF -> enable"
+			"$K" feature set su_compat 1 >> $OUT 2>&1
+			log "SU_COMPAT_SET_RC=$?"
+		else
+			log "SU_COMPAT_OK=${V:-unknown}"
+		fi
+	fi
+
 	# KSU 自己的 services 是“按开机阶段扫描”的，late-load 后不会重跑模块脚本（实测）。
 	# 直接执行本模块 service.sh：仍走 KSU 模块目录，只是由本脚本代替 stage 触发。
 	MOD=/data/adb/modules/droidspaces_shim
