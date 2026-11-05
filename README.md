@@ -156,26 +156,59 @@ su -c 'cat /data/adb/droidspaces_shim.log'
 su -c 'cat /proc/droid_lkm/features'
 ```
 
-### 5.4 开机自动加载：本机实测结论（重要）
+### 5.4 开机自动加载：本机实测结论（已闭环）
 
-**实测：手工落盘到 `/data/adb/modules/droidspaces_shim/` 后重启，`service.sh` 未被任何进程执行**
-（`/data/adb/droidspaces_shim.log` 根本不存在，`/proc/modules` 里也没有 `droid_lkm`）。
+**先说结论：本机可以做到"重启 + 跑一次 reroot.sh → 模块自动就位"，不需要任何手写 insmod。**
+链路是：`reroot.sh` 拿 root → `ksu_bringup.sh` 让 KSU 就绪 → **KSU 模块的 `service.sh` 自己 insmod**。
 
-根因：本机内核侧 KSU 没有对外暴露 UAPI（`ksud` 报 `UAPI version mismatch: kernel=0, ksud=2`），
-`ksud` 在 `late-load` 段也直接失败（`reroot.sh` 日志里是 `[*] ksud late-load ...` → `timeout: exec : No such file or directory`），
-因此 **KSU 的模块脚本执行链在本机整体不工作**。这不是本模块的问题，换任何模块都一样。
+#### 5.4.1 `UAPI=0` 的真实成因（不是版本不匹配，别去换 ko）
 
-三种兜底（按优先级）：
+- 早期看到的 `ksud` 报错是 `UAPI version mismatch: kernel=0, ksud=2`，含义是
+  **内核侧根本没有加载 `kernelsu` 模块**（kernel 侧 UAPI 读出来是 0），而不是 ksud 版本太新。
+- 本机 KSU 是 **LKM 模式**：`kernelsu.ko` 内嵌在 APK 的 `libksud.so` 里（按 KMI 一组，含 `android12-5.10_kernelsu.ko`），
+  由 `libksud.so late-load --allow-shell --package-name me.weishu.kernelsu` 加载。
+- 加载成功后实测：`/proc/modules` 出现 `kernelsu 200704 2 - Live`；
+  `ksud 3.3.0 (uapi: 2)`，`ksud module list` / `module list` 正常返回 JSON，**UAPI=2**。
+- 所以 **不需要去官方 release 找别的 kernelsu.ko**：自带的就能用，失败只是"没触发 late-load"。
+  （且官方通用 ko 的 vermagic 与本机 `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284` 不一致，硬换必然 `insmod` 失败。）
 
-1. **提权后立即 insmod（本机实际采用）**：
-   每次重启先跑 `rpproot_re/reroot.sh` 拿到 root，随后执行
-   ```
-   su -c 'insmod /data/adb/modules/droidspaces_shim/droid_lkm.ko route=2 skip_sysvipc=0 gate=1 degrade=1 verbose=1 zap_guard=1 reaper_fix=1 tick_ms=0 no_teardown=1 skip_disable_alloc=0 disable_alloc_mode=1'
-   ```
-   本仓库 `auto/round.ps1` 就是这条路径的自动化版本（实测复位后 21 s 内完成"上线→提权→可用"）。
-2. **`/data/adb/service.d/` 兜底**：已提供 `ksu/service_d_droidspaces_shim.sh`
-   （逻辑与 `service.sh` 完全一致，只是写死 `KO` 路径）。若将来 KSU 内核侧恢复正常，这条会随 `service.d` 一起被拉起。
-3. **真正要"开机即加载"**：需要内核侧带 KernelSU（UAPI ≥ 2）的 boot 镜像；纯 exploit root 的机型无法做到零人工自动加载。
+#### 5.4.2 为什么早期的 `service.sh` 一次都没跑
+
+两个独立原因叠加：
+
+1. **`reroot.sh` 自身有 bug**：它的 `SU=` 变量解析为空（日志里能看到 `reroot| SU=`），
+   于是内部所有 `"$_SU" -c ...` 都变成空命令，报 `timeout: exec : No such file or directory`，
+   `ksud late-load` 与 `reload SELinux policy` 都没执行。
+2. **开机阶段已过**：本机是"先有 root，再 late-load"，等 `kernelsu` 加载时，
+   KSU 的 `post-fs-data` / `service` 阶段早已走完；`ksud services` 也**不会**在 late-load 之后重跑脚本（实测 log 行数不变）。
+
+#### 5.4.3 闭环方案（已实测）
+
+`ksu_bringup.sh`（随 `auto/round.ps1` 自动执行）：
+
+```
+ksud module list 失败 -> 用 libksud.so late-load -> 等 UAPI 就绪 -> 执行 /data/adb/modules/droidspaces_shim/service.sh
+```
+
+`service.sh` 自己会做 `uname -r` 逐字节比对、`sha256` 校验、`insmod`、自检。
+
+实测（一次真实重启，全程无人值守；下表时间为宿主/设备时钟，两者有数秒偏差）：
+
+| 时刻 | 事件 |
+|---|---|
+| 04:35:28 | `adb reboot` |
+| 04:36:19 | 设备上线，`boot_completed=1`，uptime=21.79 |
+| 04:36:38 | `service.sh` 开始，kernel/sha256 校验通过 |
+| 04:36:41 | `reroot.sh` 恢复 root：`uid=0(root) ... context=u:r:kernel:s0`；**`insmod rc=0`** |
+| 04:36:44 | `/proc/modules`: `droid_lkm 786432 1 - Live`；`droidspaces check` → `All required features found!` |
+| 04:36:48 | 本轮结束，总耗时 **75.2 s**（从 reboot 算） |
+
+即：**reboot → 75 s → 模块已加载且 `check` 通过**，中间零人工。
+
+#### 5.4.4 保底
+
+- `/data/adb/service.d/droidspaces_shim.sh`（同一套逻辑，写死 KO 路径）仍然保留；
+- `round.ps1` 的 `Ensure-Module` 在 `ksu_bringup` 之后兜底直接 `insmod`（两者都失败时才会用到）。
 
 ## 6. 回滚
 
@@ -271,6 +304,46 @@ $ ipcrm -q 0             -> 已删除（仅表头）
 
 结论：**保持现状，不硬改**（在 `#10 已知限制` 中明确标注）。
 
+### 7.4 长时浸泡（systemd 常驻 45 分钟，每 5 分钟采样）
+
+容器 `--init=/sbin/init` 常驻，P1=13029（`comm=systemd`）全程存活；`droid_lkm` refcnt 恒为 **2**；
+`kmemleak` 本机不可用（`/sys/kernel/debug/kmemleak` 不存在）。
+
+| t | uptime | refcnt | Slab (kB) | SUnreclaim (kB) |
+|---|---|---|---|---|
+| 0 | 105.14 | 2 | 500652 | 379848 |
+| 1 | 405.28 | 2 | 507984 | 379824 |
+| 2 | 705.40 | 2 | 507912 | 379380 |
+| 3 | 1005.52 | 2 | 511600 | 382460 |
+| 4 | 1305.65 | 2 | 515992 | 385920 |
+| 5 | 1605.76 | 2 | 515056 | 384904 |
+| 6 | 1905.88 | 2 | 516124 | 385484 |
+| 7 | 2206.02 | 2 | 515920 | 385224 |
+| 8 | 2506.14 | 2 | 516060 | 385328 |
+| 9 | 2806.26 | 2 | 518296 | 387172 |
+
+**判定：无泄漏。** Slab 在 t=1~t=8 之间稳定在 **515–516 MB**（t=4 起完全平台化，期间还有回落），
+SUnreclaim 稳定在 **384–387 MB**（t=2 到 t=3 的上行是容器 systemd 自身活动，非单调增长）；
+refcnt 全程 2，容器 P1 全程存活，uptime 105 → 2806 s 无回退。
+
+### 7.5 压力场景：fork 风暴中直接 stop
+
+容器内先起 **400 个短命进程 + 200 个持续 `fork` 循环**，让容器进程数涨到 **469**，
+然后在风暴进行中执行 `droidspaces stop`：
+
+```
+STRESS_BEGIN uptime=2937.47
+p1_before=13029 exists=yes
+before_stop uptime=2943.54 container_procs=469 module=1
+stop_rc=0  -> Stopping container 'UBUNTU26' (PID 13029)... Container stopped.
+after_stop15 uptime=2970.51 p1_exists=no module=1
+uptime_monotonic=pass
+dmesg oops/BUG 扫描: 空
+```
+
+结果：**stop 在 469 个进程并发 fork 时依然 rc=0，设备不复位，无 oops，模块保持加载**。
+stop 后 `droidspaces check` 仍是 `PID namespace ✓ / IPC namespace ✓ / All required features found!`。
+
 ---
 
 ## 8. 踩雷清单（现象 / 根因 / 改法 / 验证）
@@ -295,14 +368,17 @@ $ ipcrm -q 0             -> 已删除（仅表头）
 | 16 | `insmod` 返回 rc=1 但模块已工作 | 加载路径返回值不可靠 | 以 `/proc/modules`、`/proc/droid_lkm` 为准 |
 | 17 | `tick_ms=100` 时 kmsg 10 行/秒 | B7 心跳无条件 printk | 生产 `tick_ms=0` |
 | 18 | BR 面包屑刷屏 | 按 B7 要求"verbose=0 也要打" | 属预期；后续可加专用开关 |
-| 19 | `ksud module install` 失败：`UAPI version mismatch kernel=0, ksud=2` | 内核侧 KSU 与 CLI 版本不匹配 | 手工模块目录安装（见 5.2） |
+| 19 | `ksud module install` 失败：`UAPI version mismatch kernel=0, ksud=2` | 不是版本不匹配，而是**内核侧 `kernelsu` 未加载**（UAPI 读出 0） | 先 `late-load`，加载后 UAPI=2，`ksud` 全部命令正常（见 5.4.1） |
 | 20 | `adb push` 写 `/data/adb/modules` 报 Permission denied | adb shell 是普通用户 | push 到 `/data/local/tmp`，再 `su -c cp` |
 | 21 | 调用 `disable_pid_allocation` 秒复位、无日志 | CFI（`CONFIG_CFI_CLANG=y`）+ 未导出符号间接调用 | 改 BTF 直写（`disable_alloc_mode=1`） |
 | 22 | `unshare --pid` 返回 `Invalid argument` | `CONFIG_PID_NS=n` 的预期行为 | 作为**通过**判据（且不得复位） |
-| 23 | 模块落盘到 `/data/adb/modules/` 后重启，`service.sh` 完全没执行（日志文件都不存在） | 本机内核侧 KSU UAPI=0，`ksud` 的 `late-load` 段直接失败，模块脚本执行链整体不工作 | 提权后手动/脚本 `insmod`（见 5.4）；另放 `service.d` 兜底 |
+| 23 | 模块落盘到 `/data/adb/modules/` 后重启，`service.sh` 完全没执行（日志文件都不存在） | ①`reroot.sh` 的 `SU=` 解析为空 → 内部 `late-load` 变成空命令；②late-load 发生在开机阶段之后，KSU 不会重跑 `service` 阶段 | `auto/ksu_bringup.sh`（late-load + 执行模块 `service.sh`），见 5.4.3 |
 | 24 | `adb shell 'su -c "cmd1; cmd2"'` 里第二条命令掉回 `shell` 域（`/proc/self/attr/current` = `u:r:shell:s0`，且报 `Permission denied`） | adb shell 传参 + 多层引号被外层 shell 提前切分 | 一条 `adb shell` 只放**一条** `su -c` 命令，或把逻辑写成 `.sh` push 到设备执行 |
 | 25 | `stop` 后立刻 `start` 报 `another operation is in progress on this container` | droidspaces 的停止是异步收尾，前一次 stop 尚未完成 | 脚本里先 `sleep 15~20`，再用 `droidspaces -n <name> pid` 轮询确认，最多重试 60 s |
 | 26 | `ipcmk` 输出是 `Shared memory id: 0`（不是 `id=0`） | 解析正则假设错误，`ipcrm` 拿到空参数 → rc=1 | 从 `ipcs -m` 的第 2 列取真实 id 再 `ipcrm`；实测 id 恒为 0 |
+| 27 | `reroot.sh` 打印 `SU=`、`timeout: exec : No such file or directory`，`late-load`/`reload SELinux` 全被跳过 | 脚本里 `SU=${hit%%|*}` 拿到空串，`timeout 90 "" -c ...` 直接失败 | 不要依赖它做 KSU 加载；由 `ksu_bringup.sh` 用绝对路径 `/data/local/tmp/libksud.so` 自己 `late-load` |
+| 28 | `ksud services` rc=0，但模块 `service.sh` 根本没跑（log 行数不变） | KSU 的 stage 脚本按开机阶段扫描；late-load 之后调用不会重跑 | late-load 后直接 `sh /data/adb/modules/<id>/service.sh`（仍走 KSU 模块目录，等价） |
+| 29 | `ls -d /sys/module/kernelsu` 报不存在，但 `/proc/modules` 里有 `kernelsu ... Live` | KernelSU 对自身痕迹做了隐藏，sysfs 目录不可见 | 判断 KSU 是否就绪用 `ksud module list` 的返回码，不要看 `/sys/module` |
 
 ---
 
@@ -312,18 +388,22 @@ $ ipcrm -q 0             -> 已删除（仅表头）
 
 1. 轮询 `adb devices`，等 `sys.boot_completed=1`；
 2. `su -c id` 失败 → 跑 `rpproot_re/reroot.sh`（无线 ADB token 提权，`--borno` 需 |Δt| ≤ 301 s）；
-3. **`Ensure-Module`**：`/proc/modules` 里没有 `droid_lkm` 就自动 `insmod`（本机 KSU 不会开机加载，见 5.4）；
-4. 断点写入 `/data/local/tmp/auto_state`；
-5. 每轮把 `/data/local/tmp` 的 `kB*.log`、`state`、`ds_start/stop*.log` 拉回 `auto/logs/<轮次>/`。
+3. **`Ensure-KSU`**：跑 `ksu_bringup.sh` —— KSU 未就绪就 `libksud.so late-load`，然后执行模块 `service.sh`（模块自己 `insmod`）；
+4. **`Ensure-Module`**：兜底，`/proc/modules` 里仍没有 `droid_lkm` 才直接 `insmod`；
+5. `droidspaces check` 断言 `All required features`；
+6. 断点写入 `/data/local/tmp/auto_state`；
+7. 每轮把 `/data/local/tmp` 的 `kB*.log`、`state`、`ds_start/stop*.log` 拉回 `auto/logs/<轮次>/`。
 
-实测：复位→设备上线（uptime=22.25）→自动提权（`ROOT_RESTORED uid=0(root)`）→模块加载，
-全程 **22 s**，无需人工。**不使用一键 root BAT**（其内含分区写入，违反"不刷机 / 不写分区"约束）。
+实测：**reboot → 75.2 s → 模块已加载 + `check` 通过**（其中设备上线 04:36:19、root 04:36:41、insmod 04:36:41、
+`check` 04:36:44），全程零人工、零手写 insmod。
+**不使用一键 root BAT**（其内含分区写入，违反"不刷机 / 不写分区"约束）。
 
 ---
 
 ## 10. 已知限制
 
-1. **临时 root**：本机 root 由 RPPROOT 经无线 ADB 获取，每次重启需 `reroot.sh` 重跑；KSU 的 `late-load` 段在本机报 `SU=` 为空（不影响 `su -c id` 为 uid=0）。
+1. **临时 root**：本机 root 由 RPPROOT 经无线 ADB 获取，每次重启需 `reroot.sh` 重跑；
+   该脚本自身 `SU=` 解析为空（内部 `late-load` 会失败，但 `su -c id` 仍正常）。KSU 加载由 `ksu_bringup.sh` 补上（见 5.4.3）。
 2. **`rmmod` 不可用**（EBUSY），停用只能删模块目录 + 重启。
 3. **nsfs 的 inode 是 `unlabeled_t`**：SELinux 严格模式下，普通 App（`untrusted_app`/`shell` 域）对
    `/proc/<pid>/ns/*` 的 `readlink`/`open`/`setns` 会被拒（没有针对 `unlabeled_t` 的 allow 规则），

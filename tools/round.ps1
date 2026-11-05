@@ -11,6 +11,7 @@ $adb  = "C:\jdk-25\platform-tools\adb.exe"
 if (!(Test-Path $adb)) { $adb = "C:\Users\Administrator\AppData\Local\Android\Sdk\platform-tools\adb.exe" }
 $logDir = Join-Path $root "logs\$Round"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$sw = [Diagnostics.Stopwatch]::StartNew()
 
 function Log([string]$m) {
     $line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $m
@@ -51,8 +52,18 @@ function Ensure-Root {
     return $false
 }
 
+function Ensure-KSU {
+    # 本机是 "先提权，再 late-load"：开机阶段 KSU 还没加载，post-fs-data/service 已过。
+    # ksu_bringup.sh：late-load（若未加载）+ 补触发 service 阶段（让 module service.sh 自己跑 insmod）
+    & $adb push (Join-Path $root "ksu_bringup.sh") /data/local/tmp/ksu_bringup_v2.sh 2>&1 | Out-Null
+    $r = ((& $adb shell "su -c 'sh /data/local/tmp/ksu_bringup_v2.sh'" 2>&1) -join "`n")
+    $r -split "`n" | ForEach-Object { if ($_.Trim()) { Log "ksubring| $_" } }
+    if ($r -match "KSU_UP") { Log "KSU_UP"; return $true }
+    Log "KSU_BRINGUP_FAILED"
+    return $false
+}
+
 function Ensure-Module {
-    # 本机内核侧 KSU UAPI=0，service.sh 开机不会执行（见 README 5.4）→ 提权后这里补 insmod
     $m = ((& $adb shell "grep droid_lkm /proc/modules" 2>$null) -join "").Trim()
     if ($m -match "droid_lkm") { Log "MODULE_ALREADY_LOADED"; return $true }
 
@@ -95,6 +106,11 @@ if (-not $ok) {
 }
 
 Log "device ready: $( ((& $adb shell getprop persist.sys.boot.reason.history 2>$null) -join '' ).Trim() )"
+Ensure-KSU | Out-Null
+$mK = ((& $adb shell "grep -c droid_lkm /proc/modules" 2>$null) -join "").Trim()
+Log "MODULE_AFTER_KSU_LOADED=$mK"
 Ensure-Module | Out-Null
+$chk = ((& $adb shell "su -c '/data/local/Droidspaces/bin/droidspaces check'" 2>&1) -join "`n")
+if ($chk -match "All required features") { Log "CHECK_OK" } else { Log "CHECK_FAILED" }
 Pull-Files $Round
-Log "round $Round finished"
+Log "round $Round finished elapsed=$([math]::Round($sw.Elapsed.TotalSeconds,1))s"
