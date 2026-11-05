@@ -1,0 +1,6 @@
+*.o
+*.ko
+*.log
+out/
+shim_repo/
+!prebuilt/*.ko

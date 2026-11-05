@@ -1,0 +1,82 @@
+static __nocfi noinline void droid_lkm_pidns_do_zap(struct pid_namespace *ns)
+{
+	struct pid *pid;
+	struct task_struct *task;
+	unsigned int alloc0 = droid_lkm_pidns_pid_allocated(ns);
+	int nr = 2;
+	int rounds, iter = 0, killed = 0, skipped = 0;
+	int first_pid = 0, last_pid = 0;
+	long rc;
+
+	droid_lkm_dbg("zap begin ns=%p allocated=%u\n", ns, alloc0);
+	droid_lkm_journal("zap begin ns=%p alloc=%u guard=%d\n", ns, alloc0,
+			  droid_lkm_zap_guard);
+	droid_lkm_journal("zap disable before ns=%p alloc=%u\n", ns,
+			  droid_lkm_pidns_pid_allocated(ns));
+	droid_lkm_ks.disable_pid_allocation(ns);
+	droid_lkm_journal("zap disable after ns=%p alloc=%u\n", ns,
+			  droid_lkm_pidns_pid_allocated(ns));
+
+	rcu_read_lock();
+	/*
+	 * a stock image may not export tasklist_lock. without it the walk stays
+	 * rcu protected but loses the task list serialization, which is what the
+	 * zapper can afford: it only sends SIGKILL to what it finds
+	 */
+	if (droid_lkm_ks_tasklist_lock)
+		read_lock(droid_lkm_ks_tasklist_lock);
+	idr_for_each_entry_continue(droid_lkm_pidns_idr(ns), pid, nr) {
+		task = pid_task(pid, PIDTYPE_PID);
+		if (!task)
+			continue;
+		/* 上限绑 pid_allocated 初值，idr 异常时不至于无限迭代 */
+		if (iter++ > (int)alloc0 + 64) {
+			droid_lkm_dbg("zap iter cap hit iter=%d alloc0=%u\n", iter, alloc0);
+			break;
+		}
+		droid_lkm_dbg("zap: ns=%p nr=%d task_pid=%d comm=%s fatal=%d ns_match=%d\n",
+			      ns, nr, droid_lkm_task_pid(task),
+			      droid_lkm_task_comm(task),
+			      __fatal_signal_pending(task),
+			      task_active_pid_ns(task) == ns);
+		/* 防御：只杀确实属于本 ns 的任务，避免打到宿主/别的 ns */
+		if (droid_lkm_zap_guard && task_active_pid_ns(task) != ns) {
+			skipped++;
+			continue;
+		}
+		if (!__fatal_signal_pending(task)) {
+			if (!killed)
+				first_pid = droid_lkm_task_pid(task);
+			last_pid = droid_lkm_task_pid(task);
+			killed++;
+			droid_lkm_ks.group_send_sig_info(SIGKILL, SEND_SIG_PRIV, task,
+						  PIDTYPE_MAX);
+		}
+	}
+	if (droid_lkm_ks_tasklist_lock)
+		read_unlock(droid_lkm_ks_tasklist_lock);
+	rcu_read_unlock();
+
+	droid_lkm_journal("zap loop: ns=%p killed=%d first=%d last=%d skipped=%d iter=%d\n",
+			  ns, killed, first_pid, last_pid, skipped, iter);
+
+	do {
+		rc = droid_lkm_ks.kernel_wait4(-1, NULL, __WALL, NULL);
+	} while (rc != -ECHILD);
+
+	droid_lkm_journal("zap wait4 ns=%p rc=%ld alloc=%u\n", ns, rc,
+			  droid_lkm_pidns_pid_allocated(ns));
+
+	for (rounds = 0; rounds < 500; rounds++) {
+		if (droid_lkm_pidns_pid_allocated(ns) == 0)
+			break;
+		msleep(10);
+	}
+
+	droid_lkm_dbg("zap done ns=%p allocated=%u after %d rounds\n", ns,
+		droid_lkm_pidns_pid_allocated(ns), rounds);
+	droid_lkm_journal("zap done ns=%p alloc=%u rounds=%d\n", ns,
+			  droid_lkm_pidns_pid_allocated(ns), rounds);
+}
+
+
