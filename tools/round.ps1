@@ -51,6 +51,21 @@ function Ensure-Root {
     return $false
 }
 
+function Ensure-Module {
+    # 本机内核侧 KSU UAPI=0，service.sh 开机不会执行（见 README 5.4）→ 提权后这里补 insmod
+    $m = ((& $adb shell "grep droid_lkm /proc/modules" 2>$null) -join "").Trim()
+    if ($m -match "droid_lkm") { Log "MODULE_ALREADY_LOADED"; return $true }
+
+    $ko = "/data/adb/modules/droidspaces_shim/droid_lkm.ko"
+    $args = "route=2 skip_sysvipc=0 gate=1 degrade=1 verbose=1 zap_guard=1 reaper_fix=1 tick_ms=0 no_teardown=1 skip_disable_alloc=0 disable_alloc_mode=1"
+    & $adb shell "su -c `"insmod $ko $args`"" 2>&1 | ForEach-Object { Log "insmod| $_" }
+    Start-Sleep -Seconds 2
+    $m2 = ((& $adb shell "grep droid_lkm /proc/modules" 2>$null) -join "").Trim()
+    if ($m2 -match "droid_lkm") { Log "MODULE_LOADED $m2"; return $true }
+    Log "MODULE_LOAD_FAILED"
+    return $false
+}
+
 function Pull-Files([string]$round) {
     $listed = ((& $adb shell "su -c 'ls /data/local/tmp'" 2>$null) -join "`n") -split "`n"
     $want = @()
@@ -80,5 +95,6 @@ if (-not $ok) {
 }
 
 Log "device ready: $( ((& $adb shell getprop persist.sys.boot.reason.history 2>$null) -join '' ).Trim() )"
+Ensure-Module | Out-Null
 Pull-Files $Round
 Log "round $Round finished"

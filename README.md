@@ -156,6 +156,27 @@ su -c 'cat /data/adb/droidspaces_shim.log'
 su -c 'cat /proc/droid_lkm/features'
 ```
 
+### 5.4 开机自动加载：本机实测结论（重要）
+
+**实测：手工落盘到 `/data/adb/modules/droidspaces_shim/` 后重启，`service.sh` 未被任何进程执行**
+（`/data/adb/droidspaces_shim.log` 根本不存在，`/proc/modules` 里也没有 `droid_lkm`）。
+
+根因：本机内核侧 KSU 没有对外暴露 UAPI（`ksud` 报 `UAPI version mismatch: kernel=0, ksud=2`），
+`ksud` 在 `late-load` 段也直接失败（`reroot.sh` 日志里是 `[*] ksud late-load ...` → `timeout: exec : No such file or directory`），
+因此 **KSU 的模块脚本执行链在本机整体不工作**。这不是本模块的问题，换任何模块都一样。
+
+三种兜底（按优先级）：
+
+1. **提权后立即 insmod（本机实际采用）**：
+   每次重启先跑 `rpproot_re/reroot.sh` 拿到 root，随后执行
+   ```
+   su -c 'insmod /data/adb/modules/droidspaces_shim/droid_lkm.ko route=2 skip_sysvipc=0 gate=1 degrade=1 verbose=1 zap_guard=1 reaper_fix=1 tick_ms=0 no_teardown=1 skip_disable_alloc=0 disable_alloc_mode=1'
+   ```
+   本仓库 `auto/round.ps1` 就是这条路径的自动化版本（实测复位后 21 s 内完成"上线→提权→可用"）。
+2. **`/data/adb/service.d/` 兜底**：已提供 `ksu/service_d_droidspaces_shim.sh`
+   （逻辑与 `service.sh` 完全一致，只是写死 `KO` 路径）。若将来 KSU 内核侧恢复正常，这条会随 `service.d` 一起被拉起。
+3. **真正要"开机即加载"**：需要内核侧带 KernelSU（UAPI ≥ 2）的 boot 镜像；纯 exploit root 的机型无法做到零人工自动加载。
+
 ## 6. 回滚
 
 1. `su -c 'rm -rf /data/adb/modules/droidspaces_shim'`
@@ -174,6 +195,7 @@ su -c 'cat /proc/droid_lkm/features'
 | `droidspaces check` | rc=0，`All required features found!` |
 | SysV IPC 三类（`ipcmk -Q/-M/-S`） | 全部 rc=0；容器 `ipcs` 可见；宿主 `/proc/sysvipc/*` 只有表头（隔离成立） |
 | `unshare --pid` | rc=1 `Invalid argument`（预期），且**不复位** |
+| **干净重启后**（uptime 204 s 起）start → 运行中 `stop` | **存活**（P1=13044，25 s 后 `p1_exists_after=no`，uptime 持续增长到 252 s，未复位） |
 
 ---
 
@@ -203,6 +225,8 @@ su -c 'cat /proc/droid_lkm/features'
 | 20 | `adb push` 写 `/data/adb/modules` 报 Permission denied | adb shell 是普通用户 | push 到 `/data/local/tmp`，再 `su -c cp` |
 | 21 | 调用 `disable_pid_allocation` 秒复位、无日志 | CFI（`CONFIG_CFI_CLANG=y`）+ 未导出符号间接调用 | 改 BTF 直写（`disable_alloc_mode=1`） |
 | 22 | `unshare --pid` 返回 `Invalid argument` | `CONFIG_PID_NS=n` 的预期行为 | 作为**通过**判据（且不得复位） |
+| 23 | 模块落盘到 `/data/adb/modules/` 后重启，`service.sh` 完全没执行（日志文件都不存在） | 本机内核侧 KSU UAPI=0，`ksud` 的 `late-load` 段直接失败，模块脚本执行链整体不工作 | 提权后手动/脚本 `insmod`（见 5.4）；另放 `service.d` 兜底 |
+| 24 | `adb shell 'su -c "cmd1; cmd2"'` 里第二条命令掉回 `shell` 域（`/proc/self/attr/current` = `u:r:shell:s0`，且报 `Permission denied`） | adb shell 传参 + 多层引号被外层 shell 提前切分 | 一条 `adb shell` 只放**一条** `su -c` 命令，或把逻辑写成 `.sh` push 到设备执行 |
 
 ---
 
