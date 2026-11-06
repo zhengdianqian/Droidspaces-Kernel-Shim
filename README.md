@@ -8,6 +8,7 @@
   并附上完整实验记录、踩雷清单、KSU 打包与运维脚本。
 - 实测设备：Redmi Pad Pro（dizi / SM7435P），内核 `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`，
   Android 12，KernelSU。
+- 作者：**默默的阿文**（`module.prop` 的 `author=` 同名；`droid_lkm.ko` 二进制未改动，见 §16）
 
 ---
 
@@ -22,6 +23,8 @@
 | 修复后验收 | 运行中 `stop` 连续 2 次不复位；`kill -KILL` PID1 不复位；`droidspaces check` 全绿；SysV IPC 三类通过；`unshare --pid` 返回 EINVAL 且不复位 |
 | `insmod` 后 check 短暂 ✗ | **确定性、非故障**：模块先以 `Loading`（970752 B）出现，期间 PID/IPC 两项必 ✗；**3–7 s** 后转 `Live`（786432 B）自动恢复（3/3 轮实测） |
 | App（Droidspaces UI）能否用 | **能**：KSU `su_compat=1` + `com.droidspaces.app` 在 `.allowlist`（真实 appId **10330**）→ App 内启停容器成功 |
+| Anland 显示 | **通过**：KDE Plasma 桌面/任务栏/时钟实际渲染，点击可开窗（§13） |
+| `droidspaces check` | MUST/RECOMMENDED/OPTIONAL 除 6 项内核编译期硬限制外全 ✓（§15） |
 
 ---
 
@@ -669,6 +672,388 @@ nohup sh -c 'while :; do echo "HB $(cut -d" " -f1 /proc/uptime)" >> /data/local/
 死亡时刻判定：取 `kB.log` 最后一条记录的第 3 列（µs uptime），与 kill marker 相减。
 
 ---
+
+## 13. Anland 显示（硬性验收：容器必须在 Anland 上正常显示 / 正常操作）
+
+**结论：已通过。** KDE Plasma（`plasmashell` + `kwin_wayland` + `Xwayland`）在容器内正常渲染，
+画面经 Droidspaces 的 Anland daemon 送到 `com.anland.consumer`，在平板上**可见、可点击**。
+证据：`docs/anland-desktop.png`（桌面 + 图标 + 任务栏 + 时钟 11:08 2026/11/6）、
+`docs/anland-interaction.png`（`input tap` 点开 Konsole 后窗口出现、有菜单栏与标题）。
+
+### 13.1 配置（改前均已备份）
+
+`/data/local/Droidspaces/Containers/UBUNTU26/container.config`（511 B）：
+
+```
+enable_anland=1        # 打开 Anland 显示
+enable_gpu_mode=1      # 把宿主 GPU 节点（含 /dev/dri/renderD128）镜像进容器，渲染必需
+enable_hw_access=0     # 不做全量 /dev 直通（内核无 devtmpfs，见 §14.3）
+enable_x11=0           # 不用 X11 模式；Anland 走 Wayland
+enable_virgl=0         # 关掉 VirGL（Termux 侧没有 virglrenderer，见 §14.2）
+net_mode=nat / disable_ipv6=1 / run_at_boot=0 / rootfs_path=/data/local/Droidspaces/rootfs/UBUNTU26
+```
+
+备份文件（全部保留在原目录）：
+
+| 文件 | 含义 |
+|---|---|
+| `container.config.preH.bak` | 最早的原文件（`enable_anland=0`） |
+| `container.config.preAnland.bak` | 打开 Anland 之前的状态（= preH，`enable_anland=0`） |
+| `container.config.preVirgl.bak` | 本轮把 `enable_virgl` 置 0 之前的状态（10:47） |
+
+### 13.2 启动顺序（有日志佐证）
+
+1. `droidspaces start` 先在宿主起 **Anland display daemon**：
+   `[Anland] launching display daemon on /data/local/Droidspaces/Net/anland-<hash>.sock` +
+   `Anland: daemon pid=<pid> launched`；
+2. daemon 把 socket **bind-mount 进容器**：`[Anland] display socket bind-mounted to /run/display.sock`；
+3. 容器 init 起来后 `kwin_wayland`（producer）连上 `/run/display.sock` → daemon 记 `producer connected`；
+4. Android 侧 `com.anland.consumer`（consumer）连同一 socket：
+   `consumer connected` → `consumer deposited 5 fds` → `screen info 1600x2560 fmt=1` →
+   `fds delivered to producer`；此后 kwin 才真正出图。
+
+**consumer 必须拿到 socket 路径**，intent extra key 是 `socket_path`（从 APK DEX 的
+`EXTRA_SOCKET_PATH` 实测）。socket 名**每次 start 都变**，取值必须用“最后一次 listening”：
+
+```sh
+SOCK=$(grep -a "listening on" /data/local/Droidspaces/Logs/UBUNTU26/anland | tail -1 | sed 's/.*listening on //')
+am start -n com.anland.consumer/.MainActivity --es socket_path "$SOCK"
+```
+
+> 注意：不要用 `ls -t /data/local/Droidspaces/Net/*.sock | head -1` —— 在 `su` 域下
+> `ls -t` 需要逐项 `stat`，会被 SELinux 拒（`Permission denied`），结果拿到空值或旧 socket，
+> 表现就是“consumer 连上 0.5 s 就 disconnected、屏幕全黑”。本仓库 `tools/anland_up.sh` 已改为读日志。
+
+### 13.3 容器内依赖 / 开机自启修复
+
+- `plasma-wayland.service`（`/etc/systemd/system/`）：`ExecStart=/usr/bin/bash -lc /usr/bin/startplasma-wayland`；
+- 单元已打补丁（原文件备份为 `plasma-wayland.service.prebak`）：
+  `Restart=no → always`，并在 `[Install]` 前插入 `RestartSec=5` 与 `ExecStartPre=/bin/sleep 20`；
+- `kwin_wayland`（Anland 补丁版）+ `plasmashell --no-respawn` + `Xwayland`；
+- `/etc/environment`：`ANLAND=1`、`ANLAND_SOCKET=/run/display.sock`、`ANLAND_DRM_DEVICE=/dev/dri/renderD128`。
+
+> 时序：容器 `start` 后 `plasma-wayland` 约 20 s（ExecStartPre）开始拉 plasma，
+> **再过 ~40–70 s 桌面才画全**（图标 + 任务栏）。截图要等够，否则只有壁纸 —— 这不是故障。
+
+### 13.4 实测结果（最后一轮，11:04–11:08）
+
+| 检查 | 结果 |
+|---|---|
+| daemon 起来 | `daemon: listening on …/anland-a275f4c2d9e665ae6d5b50173f6096c9.sock` |
+| `/run/display.sock` | 容器内 `srw-rw-rw-+ root root 0 Nov 6 11:06 /run/display.sock` |
+| producer | `producer connected`（kwin，11:06:41） |
+| consumer | `consumer connected` + `deposited 5 fds` + `screen info 1600x2560`（11:07:01） |
+| 画面 | 桌面/图标/任务栏/时钟实际渲染（`docs/anland-desktop.png`） |
+| 交互 | `input tap` 打开 Konsole，窗口出现且可交互（`docs/anland-interaction.png`） |
+| 与模块共存 | `droid_lkm 786432 2 - Live`，`check` 仍 `All required features found` |
+| `stop` | 不复位（`uptime_before=693.45` → `uptime_after=737.25`，差值 44 s = 脚本里 `sleep 20` + 采样开销） |
+
+### 13.5 已知限制
+
+1. 平板**息屏后** Anland 会断开（`consumer disconnected`），截图会全黑（21 KB PNG）——
+   这是 Android 休眠导致 App 暂停，不是 Anland 故障。验收前先 `svc power stayon true` + `input keyevent KEYCODE_WAKEUP`。
+2. App 必须被显式拉起（带 `socket_path`）；只起容器不拉 App 时 daemon 只有 producer，屏幕是黑的。
+3. 容器 `stop` 后再 `start`，socket 名会变，必须重新拉起 App（脚本 `tools/anland_up.sh` 已处理）。
+4. Anland 与 VirGL 目标重叠，本机取舍为 **Anland 优先**（`enable_virgl=0`）。
+
+### 13.6 回滚
+
+```sh
+C=/data/local/Droidspaces/Containers/UBUNTU26
+# 回到 Anland 打开之前（enable_anland=0）
+cp -p $C/container.config.preAnland.bak $C/container.config
+droidspaces -n UBUNTU26 stop && droidspaces -n UBUNTU26 start --init=/sbin/init
+# 回到 VirGL 打开之前
+cp -p $C/container.config.preVirgl.bak $C/container.config
+# 纯 CLI：不需要 Anland App，stop/start/run 全部照旧
+```
+
+---
+
+## 14. start 日志里的 `[!]` / `[i]` 逐条处置
+
+| 日志行 | 成因 | 处置 | 状态 |
+|---|---|---|---|
+| `[i] [CGROUP] /sys/fs/cgroup/droidspaces/UBUNTU26 is left over from an earlier run and could not be cleaned up` | droidspaces 只对**顶层**目录做 `rmdir`；上一次容器 systemd 的子组（`system.slice`/`user.slice`/`init.scope`/…）仍非空 → `ENOTEMPTY`。更深一层：**`stop` 只杀容器 init/master，user session 里的 kwin/plasmashell/dbus/systemd-networkd 会变成孤儿**并继续挂在同一 cgroup 下 | `tools/ds_start.sh`：逐层读 `cgroup.procs` 把成员 `kill -9`，再**自底向上** `rmdir`，最多重试 5 轮，最后才 `start` | **已消除**（见 §14.1） |
+| `[!] VirGL: server binary not found at /data/data/com.termux/files/usr/bin/virgl_test_server_android - skipping start` | Termux 没有 `virgl_test_server_android`（`$PREFIX/bin` 无 virgl 二进制、apt lists 为空、dpkg 未装 `virglrenderer`） | `enable_virgl=0`（Anland + GPU 节点镜像已提供渲染，VirGL 非必需） | **已消除** |
+| `[!] VirGL: socket not found at /.old_root/data/data/com.termux/files/usr/tmp/.virgl_test - skipping socket bridge` | 同上（server 没起，socket 自然不存在） | 同上 | **已消除** |
+| `[!] Hardwave access disabled: using isolated tmpfs` | 该行只在 `enable_hw_access=0` **且未开 GPU 模式**时出现；本内核 `CONFIG_DEVTMPFS=n`，无法整块 `/dev` 直通 | `enable_gpu_mode=1`：日志改为 `[GPU] --gpu mode: mirroring host GPU nodes into isolated tmpfs` / `Setting up GPU-only access...` | **已消除**（11:04 / 11:06 两次 start 均无此行） |
+| `[i] Ensuring /data is mounted with suid support...` | 正常信息行（保证容器内 suid 程序可执行），不是告警 | 无需处理 | 保留 |
+
+> 判定口径：`[!]` / `[i]` 只是 Droidspaces App 终端里的**前缀标记**，日志文件本身没有这两个字符。
+> 最后一轮两次 `start` 里 `grep -E '[CGROUP]|VirGL|Hardware access|\[!\]'` 输出为空（见 §18）。
+
+### 14.1 cgroup 清理：为什么必须“杀进程 + 递归 rmdir”
+
+实测（10:49 停止后）：
+
+- `rmdir /sys/fs/cgroup/droidspaces/UBUNTU26` → **Device or resource busy**；
+- 树里仍有进程，且是**多代残留**：`systemd-networkd`(pid 11236)、`polkitd`(15612)、`dbus`(18779)、
+  `kwin/plasmashell`(22926…) 等 —— 前几轮容器的子进程没有随容器退出，一直挂在同名 cgroup 下；
+- 逐层 `kill -9` 后再 `find … -depth | rmdir`，**第 1 轮即成功**（`pass 1 killed=32 exists=0`）。
+
+清理记录（`/data/local/tmp/ds_start.log` 实录）：
+
+```
+[10:49:55] pass 1 killed=32 exists=0
+[10:49:55] cgroup leftover cleaned: /sys/fs/cgroup/droidspaces/UBUNTU26
+[10:57:33] pass 1 killed=22 exists=0
+[10:57:33] cgroup leftover cleaned: /sys/fs/cgroup/droidspaces/UBUNTU26
+[11:04:52] pass 1 killed=36 exists=1
+[11:04:53] pass 2 killed=5  exists=0
+[11:04:53] cgroup leftover cleaned: /sys/fs/cgroup/droidspaces/UBUNTU26
+```
+
+本内核 5.10 没有 `cgroup.kill`（v2 的“一键杀空”文件），所以只能在 wrapper 里做。
+
+### 14.2 为什么不是“装个 VirGL 就完了”
+
+- Termux 侧 `$PREFIX/var/lib/apt/lists` 空、`$PREFIX/bin` 无任何 virgl 二进制、`dpkg -l` 无 `virglrenderer`；
+- VirGL 是给 X11/Hybrid 模式做 GL 转发；本机用 Anland（Wayland + `/dev/dri/renderD128`），
+  两套显示栈目标重叠。为消两条 `[!]` 再装一套栈属于反向优化，正确取舍是 **`enable_virgl=0`**。
+
+### 14.3 devtmpfs 这一层是硬限制
+
+`CONFIG_DEVTMPFS=n`（`/proc/filesystems` 无 `devtmpfs`），`mount -t devtmpfs` 返回 **ENODEV**；
+`devtmpfs` 在 Kconfig 里是 `bool`，不能编成模块（树外尝试见 §15 判定表第 1 行）。
+因此“整块 `/dev` 直通”不可能用模块补出来，能做的只有 `enable_gpu_mode=1` 的**节点级镜像**（已做）。
+
+---
+
+## 15. `droidspaces check` 剩余 ✗ 的一次性判定表
+
+口径：只看“**不刷 boot、不改内核分区**”能否变绿；每一项都用“真编 ko → 真 insmod → 看返回码”实测定性。
+
+| 项 | check 判定依据 | 现状（实测） | 树外 KO 尝试 | 结论 |
+|---|---|---|---|---|
+| devtmpfs support | `/proc/filesystems` 含 `devtmpfs` | 无；`mount -t devtmpfs` → `No such device` | `devtmpfs.ko` 编出（398880 B，vermagic 一致），`insmod` → **ENOENT**；45 个未定义符号中 **17 个本机未导出**：`ksys_unshare init_mount reconfigure_single shmem_init_fs_context device_get_devnode vfs_kern_mount vfs_mkdir vfs_mknod vfs_rmdir vfs_unlink kern_path_create kern_path_locked done_path_create init_chdir init_chroot shmem_fs_parameters block_class` | **需刷带 `CONFIG_DEVTMPFS=y` 的内核** |
+| Macvlan | 能否 `ip link add … type macvlan` | `RTNETLINK answers: Operation not supported` | `macvlan.ko` 编出（813536 B，vermagic 一致），`insmod` → **ENOENT**；85 个未定义符号中 **17 个未导出**：`dev_change_proto_down_generic __dev_forward_skb dev_forward_skb dev_mc_add_excl dev_mc_del dev_mc_sync dev_queue_xmit_accel dev_set_allmulti dev_set_promiscuity dev_uc_add dev_uc_add_excl dev_uc_del dev_uc_sync ip_check_defrag linkwatch_fire_event ndo_dflt_fdb_dump netdev_is_rx_handler_busy` | **需刷带 `CONFIG_MACVLAN=m/y` 的内核** |
+| IPv6 NAT | `ip6tables -t nat` 表是否存在 | `can't initialize ip6tables table 'nat': Table does not exist` | `ip6table_nat.ko` 编出（519032 B），`insmod` → **ENOENT**；11 个未定义符号中 **7 个未导出**：`ip6t_alloc_initial_table ip6t_do_table ip6t_register_table ip6t_unregister_table ip6t_unregister_table_exit nf_nat_ipv6_register_fn nf_nat_ipv6_unregister_fn` | **需刷带 `CONFIG_IP6_NF_NAT=y` 的内核** |
+| CPU limit | `/proc/sys/kernel/sched_cfs_bandwidth_slice_us` / cgroup2 `cpu.max` | 两者都不存在 | 无模块化接口（CFS 带宽是调度器编译期代码） | **需刷带 `CONFIG_CFS_BANDWIDTH=y` 的内核** |
+| Process limit | cgroup 里 `pids.max` | 无 `pids.max`，`cgroup.controllers` 不含 `pids` | cgroup 子系统必须静态注册，`cgroup_init_subsys()` 未导出 | **需刷带 `CONFIG_CGROUP_PIDS=y` 的内核** |
+| Sandboxing（user ns） | `unshare -U` 是否成功 | `Operation not permitted` | 涉及 cred/mm/nsproxy 核心结构，不可模块化 | **需刷带 `CONFIG_USER_NS=y` 的内核** |
+
+**一句话结论：6 项全部是内核编译期能力，树外 KO 一条也补不绿 —— 必须刷一个带对应 `CONFIG_*` 的内核。**
+本轮的“真做”部分：3 个 KO 都编出来了、都推到设备上 `insmod` 过了、失败原因逐符号定位到 GKI 符号裁剪，
+证据在 `extras/SHA256SUMS`、`extras/*.ko` 与 `tools/ko_build/`（含未导出符号清单）。
+
+> 为什么 `insmod` 报的是 `No such file or directory` 而不是 `Unknown symbol in module`：
+> 内核在加载阶段解析 `__ksymtab` 失败时直接返回 `-ENOENT`；而 `dmesg` 在本机 `su` 域下读不到，
+> 所以判定改用 `/proc/kallsyms` 里的 `__ksymtab_<sym>`（`kptr_restrict=2` 下符号名仍可读，9794 个）。
+
+### 15.1 树外 KO 构建（可复现）
+
+```sh
+make -C /opt/ddk/kdir/android12-5.10 M=$PWD ARCH=arm64 CC=clang \
+     LD=ld.lld AR=llvm-ar NM=llvm-nm STRIP=llvm-strip OBJCOPY=llvm-objcopy \
+     OBJDUMP=llvm-objdump LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- modules
+```
+
+- 源码取自 DDK 源树 `/opt/ddk/src/android12-5.10`（`drivers/net/macvlan.c`、
+  `net/ipv6/netfilter/ip6table_nat.c`、`drivers/base/devtmpfs.c`）；
+- 三个 ko 的 `vermagic` 均为 `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`；
+- **注意 PATH 顺序**：DDK 的 `clang-r416183b` 必须前置，否则系统 clang 会撞 `__LITTLE_ENDIAN_BITFIELD redefined`；
+- 脚本：`tools/ko_build/wsl_macvlan_build.sh`、`wsl_ip6nat_build.sh`、`wsl_devtmpfs_build2.sh`。
+
+### 15.2 为什么没有把这些 ko 打进模块包
+
+`service.sh` **不做**自动 `insmod extras/`：三个 ko 在本机必失败，开机每次打印失败只会污染日志。
+它们保留在 `extras/` 作为“已尝试、已失败、原因已定位”的证据（sha256 见 §16.2）。
+若要给未来机型用，把 `extras/<name>.ko` 放进模块目录并自行 `insmod` 即可，主模块不受影响。
+
+---
+
+## 16. 作者与产物
+
+### 16.1 作者 = 默默的阿文
+
+- `ksu/module.prop`：`author=默默的阿文`；
+- 模块内 `README.md`（`ksu/README-module.md`）顶部：`作者：默默的阿文`；
+- 根 README（本文件）署名同步；
+- **ko 本身未改动**：`droid_lkm.ko` sha256 仍是
+  `b710cca34249c6cf8b215b61c29ca9aa2e3be6919c9aac3123c1dabecc1603a5`，
+  `service.sh` 里的 `SHA=` 校验链因此不需要改（改名不影响校验链）；
+- 设备重装后 `ksud module list` 的 `author` 字段为 `默默的阿文`（原始输出见 §18）。
+
+### 16.2 产物 sha256（本轮定版）
+
+| 文件 | 大小 | sha256 |
+|---|---|---|
+| `prebuilt/droid_lkm_B18.ko`（= zip 内 `droid_lkm.ko`） | 10086568 | `b710cca34249c6cf8b215b61c29ca9aa2e3be6919c9aac3123c1dabecc1603a5` |
+| `ksu/service.sh`（= zip 内 `service.sh`） | — | `75e0dd0f0c8f738ca45b7347450e35cb9de65b1c1c9703edaa232f0bdff91f55` |
+| `prebuilt/droidspaces_shim-1.1.zip` | 2409665 | `eae7cf22a557181fbf9c95c853d1dd06fc8b02a598c46dab890b21e06783c968` |
+| `extras/macvlan.ko`（证据，不随包安装） | 813536 | `dc7b77f8216573d49cf1f48d656b24e9b75e99ccd8f36aa94dd34b5a7d846f3e` |
+| `extras/ip6table_nat.ko`（证据，不随包安装） | 519032 | `63607db55a1f21159b2d4e943ef0ae74ad472c345171ac36de122bc1011dd092` |
+| `extras/devtmpfs.ko`（反例，不可加载） | 398880 | `3c80c5be98eded1ef1a9a230c3909807475bc71ba0981c847935ace9cabff7b7` |
+
+zip 根目录结构：`module.prop` / `service.sh` / `droid_lkm.ko` / `README.md`（无子目录，KSud 要求）。
+
+---
+
+## 17. 重启 / 复位统计（明确数字）
+
+**总数：28 次。**
+
+口径：`persist.sys.boot.reason.history`（最近 8 条）+ 本地 adb 操作日志的并集，按时间戳去重。
+可核对窗口 `02:59:01`–`11:04:13`（11:04:13 是最后一次 `adb reboot`，用于最终验收）。
+
+| 分类 | 次数 | 说明 |
+|---|---|---|
+| 脚本重启（`reboot,shell`，含本轮收尾的 `adb reboot`） | **22** | 换 ko、`round.ps1`/`cycle_watch.ps1` 验收轮次、浸泡前准备、最后一轮干净验收 |
+| 未归因复位（`reboot`，无 shell 标记） | **6** | `02:59:01`、`03:02:57`、`03:07:11`、`06:11:32`、`06:37:43`、`07:01:23` |
+| 人为手动（长按电源） | **0** | 全程无人值守，无人工重启记录 |
+
+逐条时间戳：`docs/reboot_events.txt`。
+
+> **未归因的 6 次**：前 3 次在 B16/B17 的 stop/kill 实验期（与 `disable_pid_allocation` 直接相关，
+> 换 `disable_alloc_mode=1` 后不再出现）；后 3 次与“`su_compat=0` 状态下跑 `reroot.sh`”时间相关，
+> 但 `reroot.sh` 内无 `reboot` 调用，根因**未定位**（`su_compat=1` 下 reroot 5/5 无复位）。
+>
+> **口径限制**：系统只保留最近 8 条 boot reason，`02:59` 之前的 B7–B16 阶段重启已被覆盖，
+> 无法精确还原。28 是**设备可核对**的确定值，不含被覆盖的更早记录。
+
+### 17.1 时间线
+
+| 时间（宿主 CST） | 轮次 | 做了什么 | 结果 |
+|---|---|---|---|
+| 02:59–03:07 | B16/B17 | stall 点位二分 + `skip_disable_alloc=1` | 3 次未归因复位；锁定 `disable_pid_allocation` 间接调用 |
+| 03:25 / 03:42 | B18 | `disable_alloc_mode=1`（BTF 直写）换 ko | 定版；kill/stop 不再复位 |
+| 04:31–04:36 | round 调试 | 自动提权 / late-load / insmod 链路 | 3 次脚本重启，确认两段式 `su` 必要 |
+| 05:33–05:51 | 自动恢复 | `ksu_bringup.sh` + `service.sh` 自加载 | reboot → 全绿 ~95–101 s |
+| 05:55–06:10 | cycle 系列 | 多轮重启验收 + App/容器 apt | 稳定；App 可用（`su_compat=1`） |
+| 06:11:32 / 06:37:43 / 07:01:23 | — | 未归因复位 | 与 `su_compat=0` + reroot 时间相关，未复现 |
+| 06:23–06:52 | cycle9/10 + cycle7 复核 | 真实重启验收 | 100.7 s / 95.3 s 到全绿；`check` ✗ 窗口 3–7 s |
+| 07:04:33–10:34:44 | **浸泡** | 容器 systemd 常驻 3.5 h（14 tick/15 min） | 14/14 `check=OK`、`droid_lkm Live`、**resets=0**；TICK10 起 `dd=1 ct=1`（09:19 容器被 App 侧改写配置后重起，非复位） |
+| 09:19 | Anland 首测 | App 写入 `enable_anland=1`/`enable_gpu_mode=1` 并 start | 管线通；plasma 21 s 后退出（开机竞态） |
+| 09:25–09:42 | Anland 定版 | 手动 `systemctl start plasma-wayland` + `am start --es socket_path` | 桌面稳定渲染 + 点击可用（首张截图） |
+| 10:35 | 目标二 | 三个树外 ko 推到设备并 `insmod` | 全部 ENOENT；逐符号定位到 17/7/17 个未导出符号 |
+| 10:47–10:49 | 目标一 | `enable_virgl=0` + plasma 单元补丁 + `ds_start.sh` 预清理 | VirGL/Hardware 两条告警消失；cgroup 残留清干净 |
+| 10:52 | Anland 复验 | 新容器 + App | 桌面/交互正常；期间发现“息屏导致黑屏截图”的假故障 |
+| 10:54–10:57 | 目标三 | 重打包（改名、去 extras）→ `ksud module install` | `author=默默的阿文`；ko sha 不变；reboot 应用更新 |
+| 11:04:13 | 最终验收 | `adb reboot` → `round.ps1` 自动恢复 → 全流程 | **28 次**；76.5 s 到全绿（见 §18） |
+
+### 17.2 试错 / 失败方案（含被推翻的假设）
+
+| # | 错误假设或做法 | 怎么发现 | 怎么改 |
+|---|---|---|---|
+| 1 | “App 拿不到 root 必须刷 boot” | 用错 uid（10123，不是 Droidspaces 的 10330）测 `su` | 用真实 appId 10330 + `su_compat=1` → App 可用，假设推翻 |
+| 2 | “`UAPI=0` 是 ksud 版本太新” | 换 ko 后仍 0 | 实为内核侧 `kernelsu` 没加载；走 `libksud.so late-load` → UAPI=2 |
+| 3 | “`ksud services` 会在 late-load 后重跑模块脚本” | 日志行数不变 | 不会；必须自己 `sh service.sh`（两段式） |
+| 4 | late-load 与后续 `su` 放同一个脚本 | 下一次 `su` 阻塞 ~175 s、PATH 全丢 | 拆成两次独立 `su`，并轮询 `su -c 'id -u'` |
+| 5 | 关闭 `su_compat` 只影响 App | 关闭后 shell 的 `su` 一起消失，测试锁死 | 同一 root 会话内“关→测→开”，并写入自动流程 |
+| 6 | zip 可以带一层目录 | `ksud module install` → `specified file not found in archive` | `module.prop` 必须在根目录（本轮已按此重打包） |
+| 7 | 装完即可用 | 曾产出 10 MB 全零 ko → `insmod: Exec format error` | 装完必须 `sha256sum` 比对 |
+| 8 | PowerShell 直接 `adb shell "su -c '… \| …'"` | 引号被吞、`\|` 变管道、`$?` 被 PowerShell 求值成 `True` | 一律写设备侧 `.sh` push 后执行 |
+| 9 | “`/proc/kallsyms` 在 `kptr_restrict=2` 下查不到导出符号” | 本机实测 9794 个 `__ksymtab_*` 可读 | 用 `__ksymtab_<sym>` 判定导出（本轮 6 项判定靠它） |
+| 10 | “VirGL 装个包就行” | Termux `$PREFIX` 无 virgl 二进制、apt lists 空 | 关 `enable_virgl`，Anland/GPU 优先 |
+| 11 | “macvlan / ip6nat / devtmpfs 都能树外补绿” | 三个 ko 都能编出，但 `insmod` 全 ENOENT | 逐个核对未导出符号（17/7/17）→ **全部硬限制**，判断推翻 |
+| 12 | “plasma 开机自动起就行” | 容器 boot 时 21 s 后 `status=0` 退出，kwin crash-loop | 单元加 `ExecStartPre sleep 20` + `Restart=always` |
+| 13 | “`ls -t *.sock \| head -1` 能拿当前 socket” | 新版 socket 明明存在却拿到空/旧值，App 连上 0.5 s 即断、屏幕黑 | 改为读 anland 日志最后一条 `listening on`（SELinux 不让 `ls -t` 做 stat） |
+| 14 | “Anland 黑屏 = 显示坏了” | 截图 21 KB 全黑、`mWakefulness=Asleep` | 只是平板息屏；`svc power stayon true` + `KEYCODE_WAKEUP` 后恢复 |
+| 15 | “容器 start 完就能截图” | 只有壁纸、没有图标/任务栏 | plasmashell 要 ~40–70 s 才画全，验收脚本需等待 |
+
+### 17.3 仍未解决（清单）
+
+1. **6 项 `check` ✗ 全为内核配置硬限制**：devtmpfs / Macvlan / IPv6 NAT / CPU limit / Process limit / Sandboxing ——
+   树外 KO 不可行，必须刷带对应 `CONFIG_*` 的内核（逐项符号证据见 §15）。
+2. **未归因复位根因**：6 次中后 3 次与 `su_compat=0` + `reroot.sh` 相关，但脚本内无 `reboot`；
+   `su_compat=1` 下未复现。
+3. **`stop` 不回收容器 user session 进程**：kwin/plasmashell/dbus/systemd-networkd 会成为孤儿并挂在原 cgroup，
+   导致下一次 `start` 报 `[CGROUP] left over`；只能由 `ds_start.sh` 外部清理（本内核无 `cgroup.kill`）。
+4. **Anland 依赖显式拉起 App**：容器 `stop/start` 后 socket 名会变，必须重新 `am start --es socket_path`；
+   平板息屏会断开 consumer。
+5. **Termux VirGL 未安装**（不是必须，已由 Anland 取代）。
+6. **`/proc/<pid>/ns/pid|ipc` 缺失**：宿主 `CONFIG_PID_NS=n`，procfs 条目本就不存在，模块无法凭空造。
+
+---
+
+## 18. 最后一轮干净验收（原始输出）
+
+设备：`11:04:13 adb reboot` → `round.ps1` 自动恢复（提权 / KSU late-load / `su_compat=1` / 模块已由
+`service.sh` 自加载）→ **76.5 s 后 `CHECK_OK`**。随后 `final_accept.sh`（11:04:48 起）：
+
+```
+== date/uptime ==
+Fri Nov  6 11:04:48 CST 2026
+647.48 3683.05
+== 模块 ==
+droid_lkm 786432 2 - Live 0x0000000000000000 (O)
+kernelsu 200704 1 - Live 0x0000000000000000 (O)
+== KSU 模块作者 / module.prop ==
+id=droidspaces_shim
+name=Droidspaces Kernel Shim
+version=1.1 (android12-5.10 / 5.10.236-dizi)
+versionCode=2
+author=默默的阿文
+description=Loads droid_lkm.ko at boot so Droidspaces sees PID/IPC namespace + SysV IPC. The module pins itself, so disabling means deleting the module dir and rebooting.
+-- service.sh sha（应与仓库 ksu/service.sh 一致：75e0dd0f…）--
+75e0dd0f0c8f738ca45b7347450e35cb9de65b1c1c9703edaa232f0bdff91f55  /data/adb/modules/droidspaces_shim/service.sh
+-- ko sha（必须 b710cca3…）--
+b710cca34249c6cf8b215b61c29ca9aa2e3be6919c9aac3123c1dabecc1603a5  /data/adb/modules/droidspaces_shim/droid_lkm.ko
+== ksud module list 本模块条目 ==
+{ "versionCode": "2", "enabled": "true", "action": "false", "mount": "false",
+  "author": "默默的阿文", "id": "droidspaces_shim", "web": "false",
+  "name": "Droidspaces Kernel Shim", "remove": "false", "update": "false",
+  "version": "1.1 (android12-5.10 / 5.10.236-dizi)" }
+== su_compat ==
+Feature: su_compat (0)
+Value: 1
+Status: enabled
+== check（完整原文，摘要） ==
+[MUST HAVE]  Root privileges / Linux version / PID namespace / Mount namespace / UTS namespace /
+             IPC namespace / pivot_root / /proc / /sys / Seccomp          → 10/10 ✓
+[RECOMMENDED] epoll / signalfd / PTY / devpts / Loop / ext4 / Cgroup v2 / Cgroup ns → 8/8 ✓
+              devtmpfs support                                        → ✗（硬限制，见 §15）
+[OPTIONAL]   FUSE / TUN-TAP / OverlayFS / Net ns / Bridge / Veth / Memory / Swap /
+             CPU accounting                                           → 9/9 ✓
+             Macvlan / IPv6 NAT / CPU limit / Process limit / Sandboxing → ✗（硬限制，见 §15）
+Summary: [✓] All required features found!
+== start（ds_start.sh 预清理 + start） ==
+Container: UBUNTU26 (RUNNING)  PID: 32191  OS: Ubuntu 26.04 LTS
+  Networking: NAT / NAT IP 172.28.106.33 / Disable IPv6: yes
+  Android storage: enabled / HW access: GPU / Anland: enabled / SELinux: Enforcing
+== 本次 start 的告警行（空=无 [!]/[CGROUP]/VirGL/Hardware） ==
+（空）
+== ds_start 清理记录 ==
+[10:49:55] pass 1 killed=32 exists=0
+[10:57:33] pass 1 killed=22 exists=0
+[11:04:52] pass 1 killed=36 exists=1
+[11:04:53] pass 2 killed=5  exists=0
+== anland socket / 容器内 plasma ==
+srw-rw-rw- 1 root root 0 2026-11-06 11:04 anland-5e202eaa74b1998d04419b497fdcf820.sock
+active
+srw-rw-rw-+ 1 root root 0 Nov  6 11:04 /run/display.sock
+  227 /usr/bin/kwin_wayland_wrapper --xwayland
+  240 /usr/bin/kwin_wayland --wayland-fd 7 --socket wayland-0 --xwayland-fd 8 …
+== stop 测试（复位与否） ==
+[+] Stopping container 'UBUNTU26' (PID 32191)...
+[+] Container 'UBUNTU26' stopped.
+uptime_before=693.45 uptime_after=737.25 delta=44s
+-- stop 后模块 --
+droid_lkm 786432 2 - Live 0x0000000000000000 (O)
+== 再 start（留运行态） ==
+Anland: enabled / HW access: GPU / Container 'UBUNTU26' is running in background.
+-- 告警行（空=无）--
+（空）
+-- plasma --
+active
+srw-rw-rw-+ 1 root root 0 Nov  6 11:06 /run/display.sock
+== 拉起 Anland App ==
+SOCK=/data/local/Droidspaces/Net/anland-a275f4c2d9e665ae6d5b50173f6096c9.sock
+== anland log tail ==
+[11:06:19] listening on …/anland-a275f4c2d9e665ae6d5b50173f6096c9.sock
+[11:06:41] producer connected
+[11:07:01] consumer connected
+[11:07:01] consumer deposited 5 fds
+[11:07:01] screen info 1600x2560 fmt=1
+[11:07:01] fds delivered to producer
+== 最终 check ==
+Summary: [✓] All required features found!
+```
+
+截图（11:08，`docs/anland-desktop.png`）：KDE 桌面 + 22 个图标 + 底部任务栏 + 时钟 `11:08 2026/11/6`；
+`docs/anland-interaction.png`：`input tap` 点开 Konsole，窗口与菜单栏渲染正常。
+
 
 ## License
 

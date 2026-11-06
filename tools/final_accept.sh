@@ -1,54 +1,57 @@
 #!/system/bin/sh
-# FINAL：新开机（干净启动）下的最终验收 —— start 后运行中 stop，必须存活
-export PATH=/system/bin:/system/xbin:/vendor/bin:/sbin
-D=/data/local/tmp
-S=$D/kFINAL_state.txt
-L=$D/kFINAL.log
+# final_accept.sh —— 重启后最后一轮干净验收：check 全绿 + Anland 显示 + start/stop 不复位
 DS=/data/local/Droidspaces/bin/droidspaces
-R=/data/local/Droidspaces/rootfs/UBUNTU26
+OUT=/data/local/tmp/final_accept.txt
+{
+echo "== date/uptime =="; date; cat /proc/uptime
+svc power stayon true
+input keyevent KEYCODE_WAKEUP
+echo "== 模块 =="; grep -E '^droid_lkm |^kernelsu ' /proc/modules
+echo "== KSU 模块作者 / module.prop =="
+cat /data/adb/modules/droidspaces_shim/module.prop
+echo "-- service.sh sha（应与仓库 ksu/service.sh 一致：75e0dd0f…）--"
+sha256sum /data/adb/modules/droidspaces_shim/service.sh
+echo "-- ko sha（必须 b710cca3…）--"
+sha256sum /data/adb/modules/droidspaces_shim/droid_lkm.ko
+echo "== ksud module list 本模块条目 =="
+/data/adb/ksu/bin/ksud module list 2>&1 | tr -d '\n' | tr '}' '\n' | grep droidspaces_shim
+echo "== su_compat =="
+/data/adb/ksu/bin/ksud feature get su_compat 2>&1
 
-rm -f $S $L
-nohup tee -a $L < /dev/kmsg >/dev/null 2>&1 &
-nohup sh -c 'while :; do sync; sleep 1; done' >/dev/null 2>&1 &
-sleep 3
-m() { echo "[$1] uptime=$(cut -d' ' -f1 /proc/uptime) epoch=$(date +%s)" >> $S; echo "MF:$1 uptime=$(cut -d' ' -f1 /proc/uptime)" > /dev/kmsg; sync; }
+echo "== check（完整原文） =="
+$DS check 2>&1
 
-m BOOT_ANCHOR
-sleep 1
-C1=$(grep -a -c 'MF:BOOT_ANCHOR' $L 2>/dev/null)
-echo "capture_marker_hits=$C1" >> $S
-if [ "$C1" -eq 0 ]; then echo "CAPTURE_FAIL"; exit 9; fi
+echo "== start（ds_start.sh 预清理 + start） =="
+sh /data/local/tmp/ds_start.sh UBUNTU26 2>&1 | tail -18
+sleep 40
+echo "== 本次 start 的告警行（空=无 [!]/[CGROUP]/VirGL/Hardware） =="
+tail -n 160 /data/local/Droidspaces/Logs/UBUNTU26/log | tr -d '\000' | grep -nE '\[CGROUP\]|VirGL|Hardware access|\[!\]'
+echo "== ds_start 清理记录 =="
+tail -n 6 /data/local/tmp/ds_start.log
+echo "== anland socket / 容器内 plasma =="
+ls -la /data/local/Droidspaces/Net/ 2>&1
+$DS -n UBUNTU26 run -- /bin/sh -c 'systemctl is-active plasma-wayland; ls -la /run/display.sock; ps -eo pid,args | grep -E "kwin_wayland|plasmashell" | grep -v grep | head -3' 2>&1
+echo "== Anland 日志 =="
+tail -n 6 /data/local/Droidspaces/Logs/UBUNTU26/anland 2>&1
 
-printf '#!/bin/sh\nwhile :; do sleep 600; done\n' > $R/keepalive.sh
-chmod 755 $R/keepalive.sh
-sync
-m KEEPALIVE_READY
-
-m START_BEGIN
-nohup $DS -n UBUNTU26 start --init=/keepalive.sh > $D/ds_startFINAL.log 2>&1 &
-sleep 12
-P1=$($DS -n UBUNTU26 pid 2>/dev/null)
-echo "P1=$P1 exists=$([ -d /proc/$P1 ] && echo yes || echo no)" >> $S
-m DUMP_DONE
-
-m CHECK_BEGIN
-$DS check >> $S 2>&1
-echo "check_rc=$?" >> $S
-m CHECK_DONE
-
-m STOP_BEGIN
-nohup $DS -n UBUNTU26 stop > $D/ds_stopFINAL.log 2>&1 &
-sleep 5
-m STOP_AFTER5
+echo "== stop 测试（复位与否） =="
+U1=$(cut -d' ' -f1 /proc/uptime)
+$DS -n UBUNTU26 stop 2>&1 | tail -5
 sleep 20
-m STOP_AFTER25
-echo "p1_exists_after=$([ -d /proc/$P1 ] && echo yes || echo no)" >> $S
-echo "stop_log=$(cat $D/ds_stopFINAL.log 2>/dev/null | tr '\n' '|')" >> $S
-sync
+U2=$(cut -d' ' -f1 /proc/uptime)
+echo "uptime_before=$U1 uptime_after=$U2 delta=$((${U2%.*} - ${U1%.*}))s"
+echo "-- stop 后模块 --"; grep '^droid_lkm ' /proc/modules
 
-m UNMOUNT_BEGIN
-UNMOUNT_OK=no
-[ -f $R/../unshare_probe ] && UNMOUNT_OK=yes
-m FINAL_DONE
-sync
-echo kfinal_done
+echo "== 再 start（留运行态给用户验收） =="
+sh /data/local/tmp/ds_start.sh UBUNTU26 2>&1 | tail -8
+sleep 40
+echo "-- 告警行（空=无）--"
+tail -n 140 /data/local/Droidspaces/Logs/UBUNTU26/log | tr -d '\000' | grep -nE '\[CGROUP\]|VirGL|Hardware access'
+echo "-- plasma --"
+$DS -n UBUNTU26 run -- /bin/sh -c 'systemctl is-active plasma-wayland; ls -la /run/display.sock' 2>&1
+echo "== 拉起 Anland App =="
+sh /data/local/tmp/anland_up.sh
+echo "== 最终 check =="
+$DS check 2>&1 | tail -5
+} > $OUT 2>&1
+cat $OUT

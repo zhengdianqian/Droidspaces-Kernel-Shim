@@ -1,5 +1,8 @@
 # droidspaces_shim
 
+作者：默默的阿文
+
+
 在开机（late_start）阶段自动 `insmod droid_lkm.ko`，让 Droidspaces 在
 `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`（Redmi Pad Pro / dizi）上
 看到 PID/IPC namespace 与 SysV IPC。

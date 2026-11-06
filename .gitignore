@@ -4,3 +4,4 @@
 out/
 shim_repo/
 !prebuilt/*.ko
+!extras/*.ko

@@ -86,4 +86,7 @@ else
 	log "WARN: insmod rc=0 but /proc/droid_lkm did not appear"
 fi
 
+# 7) 树外 KO（macvlan / ip6table_nat / devtmpfs）已实测不可加载（GKI 未导出所需符号，
+#    insmod 返回 ENOENT），因此不再随包分发、也不在本脚本里尝试加载。
+#    证据与判定见 README 第 15 节；要补绿这 6 项只能刷带对应 CONFIG 的内核。
 exit 0

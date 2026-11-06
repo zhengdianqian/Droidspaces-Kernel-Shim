@@ -2,5 +2,5 @@ id=droidspaces_shim
 name=Droidspaces Kernel Shim
 version=1.1 (android12-5.10 / 5.10.236-dizi)
 versionCode=2
-author=Dere3046 (packaged locally)
+author=默默的阿文
 description=Loads droid_lkm.ko at boot so Droidspaces sees PID/IPC namespace + SysV IPC. The module pins itself, so disabling means deleting the module dir and rebooting.
