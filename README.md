@@ -1248,6 +1248,84 @@ prebuilt/droidspaces_shim-1.1.zip c45bf93d68ff6a933614b295be294abf426d4297d147b9
 `/data/adb/modules/droidspaces_shim/` 并手动 `nohup` 起看门狗（免重启生效）。
 累计仍为 **28 次**（§17）。
 
+## 20. 模块备份与校验（GitHub 直取）
+
+模块本体也入库做备份：本地机器或设备出问题时，可以直接从本仓库取回 `droid_lkm.ko` 和 KSU 模块 zip。
+**这是备份用途，不改变设备上已加载的模块；替换正在使用的 ko 需要重启。**
+
+### 20.1 文件清单
+
+| 文件 | 路径 | 大小（字节） | sha256 |
+|---|---|---|---|
+| 内核模块（设备在用的同一份） | `prebuilt/droid_lkm.ko` | 10086568 | `b710cca34249c6cf8b215b61c29ca9aa2e3be6919c9aac3123c1dabecc1603a5` |
+| 内核模块（历史命名，字节完全相同） | `prebuilt/droid_lkm_B18.ko` | 10086568 | `b710cca34249c6cf8b215b61c29ca9aa2e3be6919c9aac3123c1dabecc1603a5` |
+| KSU 模块 zip（可直接安装） | `prebuilt/droidspaces_shim-1.1.zip` | 2411462 | `c45bf93d68ff6a933614b295be294abf426d4297d147b9e99a67cc7647257bf6` |
+
+zip 内文件（**全部位于 zip 根**）：
+
+```
+module.prop
+service.sh
+orphan_watch.sh
+droid_lkm.ko
+README.md
+```
+
+### 20.2 三处一致性（实测）
+
+| 位置 | sha256 |
+|---|---|
+| 仓库 `prebuilt/droid_lkm.ko` / `prebuilt/droid_lkm_B18.ko` | `b710cca3…603a5` |
+| 设备 `/data/adb/modules/droidspaces_shim/droid_lkm.ko` | `b710cca3…603a5` |
+| zip 内 `droid_lkm.ko` | `b710cca3…603a5` |
+
+三处完全一致；`enable_x11` 与内核模块参数均未改动。
+
+### 20.3 取回与校验（可直接复制执行）
+
+```sh
+# 1) 取文件（任选其一：单文件 raw，或整包 clone）
+curl -L -o droid_lkm.ko \
+  https://raw.githubusercontent.com/zhengdianqian/Droidspaces-Kernel-Shim/master/prebuilt/droid_lkm.ko
+curl -L -O \
+  https://raw.githubusercontent.com/zhengdianqian/Droidspaces-Kernel-Shim/master/prebuilt/droidspaces_shim-1.1.zip
+
+# 2) 校验
+sha256sum droid_lkm.ko droidspaces_shim-1.1.zip
+#   期望：
+#   b710cca34249c6cf8b215b61c29ca9aa2e3be6919c9aac3123c1dabecc1603a5  droid_lkm.ko
+#   c45bf93d68ff6a933614b295be294abf426d4297d147b9e99a67cc7647257bf6  droidspaces_shim-1.1.zip
+
+# 3) 校验 zip 内的 ko 与单文件 ko 是同一份
+unzip -p droidspaces_shim-1.1.zip droid_lkm.ko | sha256sum
+#   期望同上：b710cca3…
+```
+
+### 20.4 安装位置与恢复
+
+模块安装目录：`/data/adb/modules/droidspaces_shim/`，内容为
+`module.prop` / `service.sh` / `orphan_watch.sh` / `droid_lkm.ko`（zip 根直接对应这个目录）。
+
+```sh
+# 方式 A：KSU 管理器里“从本地安装”选 zip（推荐）
+# 方式 B：手工解压到模块目录（需 root）
+su
+mkdir -p /data/adb/modules/droidspaces_shim
+cd /data/adb/modules/droidspaces_shim
+# 把 zip 里的 4 个文件放进来（不要多一层子目录！）
+chmod 644 droid_lkm.ko module.prop
+chmod 755 service.sh orphan_watch.sh
+# 重启后 service.sh 自动 insmod
+```
+
+**打包注意（之前踩过的坑）**：KSU 只认 zip 根目录下的 `module.prop`。如果把文件放进
+`droidspaces_shim/` 子目录再压缩，管理器会提示“模块格式错误”。正确做法是进入文件所在目录后
+`zip -r ../droidspaces_shim-1.1.zip .`，或按本仓库的 `python3 zipfile` 方式逐个写入根路径
+（见 `tools/` 中的打包脚本）。
+
+**恢复时不要做的事**：容器运行中不要直接覆盖 `/data/adb/modules/…/droid_lkm.ko`
+（正在加载的 ko 被替换会让 `rmmod` 与校验对不上）；先 `stop` 容器，替换，再重启。
+
 ## License
 
 GPL-2.0（随上游 `Dere3046/_patchHarmony`）。本仓库的修改同样以 GPL-2.0 发布。
