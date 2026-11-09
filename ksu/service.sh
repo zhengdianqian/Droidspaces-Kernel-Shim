@@ -97,7 +97,8 @@ fi
 #    否则 pkill -f orphan_watch.sh 会把 supervisor 一起杀掉，自恢复就失效了。
 WD=$MODDIR/orphan_watch.sh
 if [ -f "$WD" ]; then
-	if ps -A -o args 2>/dev/null | grep -q 'while :; do sh'; then
+	# 注意：grep 的模式必须写成 's[h]'，否则 grep 自己的命令行也含该串，会恒为真
+	if ps -A -o args 2>/dev/null | grep -q 'while :; do s[h]'; then
 		log "watchdog supervisor already running"
 	else
 		nohup env WD="$WD" sh -c 'while :; do sh "$WD"; sleep 2; done' >/dev/null 2>&1 &

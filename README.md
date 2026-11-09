@@ -1475,6 +1475,74 @@ v2 慢的两个具体原因（实测）：
 
 自恢复：`pkill -f orphan_watch.sh` 后 3 s 内子进程恢复为 1。
 
+### 22.5 重启后验证（D 阶段，两次真实重启）
+
+前置事实：重启后**临时 root 必须人工在 KernelSU 管理器里点一次**（界面上的"未安装 / 点击安装"卡片；
+点进去不要选刷写镜像那条路）。这一步本轮由老板手动完成，脚本侧没有代劳，**不计入自动化**。
+拿到 root 的瞬间，KSU 会自动执行 `/data/adb/service.d/droidspaces_shim.sh` 与模块 `service.sh`
+（`insmod droid_lkm` → 起看门狗），这两步是全自动的，两次重启的日志都验证到了。
+
+重启 1（开机 00:46:15，root 于 00:50:27 授予）：
+
+```
+00:50:27  [service.d] service.d script started
+00:50:30  [service] insmod rc=0 → loaded: droid_lkm 786432 1 - Live
+00:50:30  [service.d] delegate rc=0
+```
+
+| 场景 | stop 总耗时 | kwin | plasma | dbus | Xwayland | cgroup 进程 | 目录 | CPU ticks |
+|---|---|---|---|---|---|---|---|---|
+| **重启后第一次 stop** | **1.25 s** | 0 | 0 | 0 | 0 | 0 | 已删 | 进程已消失 |
+| 连续轮 1 | 0.93 s | 0 | 0 | 0 | 0 | 0 | 已删 | 已消失 |
+| 连续轮 2 | 1.81 s | 0 | 0 | 0 | 0 | 0 | 已删 | 已消失 |
+| 连续轮 3 | 1.04 s | 0 | 0 | 0 | 0 | 0 | 已删 | 已消失 |
+| 脚本 stop | 3.15 s | 0 | 0 | 0 | 0 | 0 | 已删 | `ZERO_LEAK` |
+
+第一次 stop 的 0.1 s 时序：`+0.17 s` init 消失 → 看门狗立即 DRAIN（41 个进程）→
+`+1.05 s` kwin 消失 → `+1.25 s` stop 返回。容器日志 `Stopping → stopped` 仅 0.84 s。
+
+重启 2（开机 00:53:2x，root 于 00:54:1x 授予）：
+
+```
+00:54:12  [service.d] service.d script started
+00:54:17  [service] insmod rc=0 → loaded: droid_lkm 786432 1 - Live
+00:54:17  [service] orphan_watch supervisor started pid=13399   ← 全自动，无需人工
+```
+
+| 场景 | stop 总耗时 | kwin | plasma | dbus | Xwayland | cgroup 进程 | 目录 | CPU ticks |
+|---|---|---|---|---|---|---|---|---|
+| **重启后第一次 stop** | **1.33 s** | 0 | 0 | 0 | 0 | 0 | 已删 | 进程已消失 |
+| 桌面交互后 stop（Anland 全流程） | 1.37 s | 0 | 0 | 0 | 0 | 0 | 已删 | 已消失 |
+| 连续轮 2 | 0.65 s | 0 | 0 | 0 | 0 | 0 | 已删 | 已消失 |
+| 连续轮 3 | 0.89 s | 0 | 0 | 0 | 0 | 0 | 已删 | 已消失 |
+| 脚本 stop | 3.02 s | 0 | 0 | 0 | 0 | 0 | 已删 | `ZERO_LEAK` |
+
+Anland 全流程：起容器（T5 = 3.7 s 桌面可用）→ 截图确认桌面/任务栏正常 → 按 Meta 键调出
+应用启动器（交互成功）→ stop 1.37 s、零残留。
+
+`ds-zap` 始终存在（kthread，ppid=2），属于 droidspaces 的常驻基础设施，不是残留。
+
+### 22.6 本轮踩到并修掉的回归（如实记录）
+
+1. `service.sh` 判断"看门狗是否已在跑"用了 `grep -q 'while :; do sh'`，
+   **grep 自己的命令行也含这串**，导致恒为真 → 重启 1 时看门狗没起来（日志写
+   `watchdog supervisor already running` 但实际没有进程）。改为 `'while :; do s[h]'` 后，
+   重启 2 的日志确认 `orphan_watch supervisor started pid=13399`。
+2. v3 早期版本假设"容器 PID1 在 cgroup 顶层"，实测**不成立**（顶层是 droidspaces 的 monitor），
+   导致启动窗口内认不出 init、误把启动当成泄漏。现改为全树枚举 + 单次 `ps` 交叉定位。
+3. v3 早期把 `cprocs` 写成 `find … -exec cat {} \;`，53 个 `cgroup.procs` 要 1.30 s；
+   改 `find -print0 | xargs -0 cat` 后 0.08 s，这是 stop 从 5~8 s 降到 1.2~1.4 s 的关键。
+4. 若在容器**正在运行**时再调一次 `ds_start.sh`，它会先做预清理再 start，会把旧容器拆掉并
+   多等一轮（实测 T5 涨到 147 s）。这是测试脚本的行为，不是产品路径；正常使用不会这样点。
+
+### 22.7 结论与剩余限制
+
+- 满足判据：两次真实重启的"第一次 stop"分别为 1.25 s / 1.33 s，全部轮次 kwin=0、
+  cgroup=0、目录已删、无 CPU ticks 增长，无任何一轮超过 3 s 或出现残留。
+- 浏览器/桌面侧无需人工查进程：看门狗常驻 + 排空后确定性校验 + 空闲每 10 s 复验。
+- 仍存在的硬限制（不在本仓库可修范围）：`CONFIG_PID_NS=n` 导致必须靠外部看门狗回收；
+  6 项内核 CONFIG 缺失（见第 15 节）；`su` 域偶发漂移到 `u:r:shell:s0`（脚本已加守卫）。
+
 ## License
 
 GPL-2.0（随上游 `Dere3046/_patchHarmony`）。本仓库的修改同样以 GPL-2.0 发布。
