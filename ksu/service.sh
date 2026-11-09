@@ -89,4 +89,18 @@ fi
 # 7) 树外 KO（macvlan / ip6table_nat / devtmpfs）已实测不可加载（GKI 未导出所需符号，
 #    insmod 返回 ENOENT），因此不再随包分发、也不在本脚本里尝试加载。
 #    证据与判定见 README 第 15 节；要补绿这 6 项只能刷带对应 CONFIG 的内核。
+
+# 8) 启动孤儿看门狗：容器 stop 后（无论 CLI 还是 App 触发）把残留进程清干净。
+#    这是 no_teardown=1 的必然副产物 —— 内核不会回收 pidns 成员。
+WD=$MODDIR/orphan_watch.sh
+if [ -f "$WD" ]; then
+	if ps -A -o args 2>/dev/null | grep -q '[o]rphan_watch.sh'; then
+		log "watchdog already running"
+	else
+		nohup sh "$WD" >/dev/null 2>&1 &
+		log "orphan_watch started pid=$!"
+	fi
+else
+	log "skip watchdog: $WD missing"
+fi
 exit 0

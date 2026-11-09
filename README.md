@@ -1055,6 +1055,199 @@ Summary: [✓] All required features found!
 `docs/anland-interaction.png`：`input tap` 点开 Konsole，窗口与菜单栏渲染正常。
 
 
+## 19. 交付版缺陷修复：启动慢/报错、stop 慢、kwin_wayland 孤儿（2026-11-09）
+
+老板实测反馈（原话）：
+
+> 平板目前功能还是比较正常的就是有个很严肃的问题，Droidspaces 启动的时候很慢，有报错，关闭的时候也很慢，
+> 然后一但使用 anland 过后，我关闭了容器进程里面就有一个 KWIN_WAYLAND 你疯狂持续高占用 CPU，居然没有
+> 一起关闭，这是一个严重的 BUG，需要马上修复！
+
+本轮定位到 droidspaces 已升到 **v7.2.0**（上一轮验收的是 7.1.0），新增常驻 `ds-zap` helper（kthread，
+ppid=2），会收养容器退出后的孤儿进程 —— 这是问题 3 的直接放大器。**本轮只改脚本与配置层，`
+droid_lkm.ko` 未重编、未替换，sha256 仍是 `b710cca3…`。**
+
+### 19.1 问题 3：kwin_wayland 孤儿（最严重，优先修）
+
+**现场证据（`stop` 之后立刻抓）**
+
+```
+kwin_wayland  PID 19331  utime+stime 32895 → 33405 ticks / 5 s   ≈ 102% CPU
+父链：kwin_wayland(19331) → kwin_wayland_wrapper(19319) → systemd(19137) → ds-zap(15798) → kthreadd(2)
+cgroup：/sys/fs/cgroup/droidspaces/UBUNTU26/… 内仍有 172 个进程
+systemd --user：8 代（etime 2–21 h），全部挂着没退
+`droidspaces show`：已经显示 “No containers running”
+```
+
+即：容器“已经关了”，但 kwin_wayland 还在 Anland socket 上空转烧一个核。
+
+**根因**
+
+1. 内核 `CONFIG_PID_NS=n`，`droid_lkm` 只能以 `no_teardown=1` 运行 —— 容器 PID1 退出时，内核**不会**
+   回收该 pid 命名空间的其余进程（改 `no_teardown=0` 会走 `find_child_reaper` BUG，不能动）。
+2. v7.2.0 的 `ds-zap` 把孤儿收养过来，进程于是**继续活着**，而不是被 init 收尸。
+3. `droidspaces stop` 的可执行文件只 kill 容器 init，然后**等** pidns 自然清空 → 等不到就超时，
+   残余进程原地留下。
+
+**修法（三层）**
+
+| 层 | 文件 | 做法 |
+|---|---|---|
+| CLI 快速路径 | `tools/ds_stop.sh` | 直接 `kill -9` cgroup 内**全部**进程（含 init）→ 调一次 `droidspaces stop` 做元数据/网络收尾 → 轮询等 NAT/veth/anland 拆完 → **按父链兜底**（ppid=ds-zap 的孤儿）→ 递归 `rmdir` cgroup（5.10 无 `cgroup.kill`）→ 零残留校验并输出 `RESULT=ZERO_LEAK` |
+| App 路径兜底 | `ksu/orphan_watch.sh` + `ksu/service.sh` 第 8 步 | 常驻看门狗，3 s 扫一次 `/sys/fs/cgroup/droidspaces/*`；判定“cgroup 里还有进程、但已经没有 NSpid 末位=1 的 init，且此前见过 init” → `kill -9` + 递归 `rmdir`。这样不论在 App 里点 Stop 还是命令行 stop，都会在数秒内清干净 |
+| 防复发 | `tools/ds_start.sh` | start 前先预清理残留 cgroup（顺带消掉 `[CGROUP] left over`） |
+
+> 看门狗只在“曾经真正起来过 init”的容器上动手（靠 `/data/local/tmp/.wd/<name>` marker），
+> 避免和刚创建的 cgroup 抢时序；空 cgroup 且目录 mtime >5 s 才删。
+
+### 19.2 问题 2：stop 慢
+
+**原始时间线（修复前，`/data/local/Droidspaces/Logs/UBUNTU26/log`）**
+
+```
+Stopping container 'UBUNTU26' (PID …)...
+[Anland] terminating ...
+[IPT] remove_ds_rules: iptables/ip6tables
+[IPT] ip6tables get_table('nat') GET_INFO failed: No such file or directory
+        ← 空档 5.16 s
+[+] Container 'UBUNTU26' stopped.
+```
+
+实测整条 stop **29.4 s**，且留下 172 个孤儿（问题 3）。
+
+**那 15 s 卡在哪**
+
+卡在“停掉 init 之后等 pidns 排空”。因为 `no_teardown=1` 内核永远不会替我们回收，只能等超时。
+剩下的固定 ~5 s 来自 `ip6tables ... nat` 表不存在（内核 `CONFIG_IP6_NF_NAT=n`，见 §15），
+`get_table` 失败后 droidspaces 内部固定等待 —— **脚本层无法消除**。
+
+**是否必须 graceful**
+
+不必须。本内核下“优雅关闭”实际只是杀 init + 干等，既不会通知 user session，也不会回收进程。
+改成快速路径（先杀干净再让 droidspaces 收尾）后语义等价，且不再有 15 s 干等。
+
+**修复后实测（5 轮，`stop+0s` / `stop+30s` 都查）**
+
+| 轮 | stop 耗时 | RESULT | +0 s | +30 s |
+|---|---|---|---|---|
+| 1 | **3.43 s** | ZERO_LEAK | kwin/plasma/cgroup/nat/veth 全 0 | 全 0 |
+| 2 | **2.81 s** | ZERO_LEAK | 全 0 | 全 0 |
+| 3 | **3.07 s** | ZERO_LEAK | 全 0 | 全 0 |
+| 4 | **2.77 s** | ZERO_LEAK | 全 0 | 全 0 |
+| 5 | **3.11 s** | ZERO_LEAK | 全 0 | 全 0 |
+
+拆段（第 1 轮）：`cgroup 枚举 1.61 s` → `KILL 全部 0.11 s` → `droidspaces stop 0.06 s` →
+`网络拆完 1.08 s` → `兜底 0.29 s`。
+
+**App 路径（原生 `droidspaces stop`，不走包装器）**
+
+原生 stop **5.20 s** 返回（看门狗在 init 死后 ≤3 s 内清掉 41 个进程，stop 因此提前结束），
+`+0 s / +5 s / +30 s` 三次快照：kwin=0、plasmashell=0、cgroup=0、nat=0、veth=0。
+看门狗日志：
+
+```
+[2026-11-09 23:06:42] LEAK cgroup=UBUNTU26 procs=41 -> kill+rmdir
+[2026-11-09 23:06:44]   after: cgroup_exists=0 procs=0
+```
+
+### 19.3 问题 1：启动慢 + 有报错
+
+**`[!]` / `[-]` 逐条定性**
+
+| 原始行 | 定性 | 处置 |
+|---|---|---|
+| `[!] VirGL: server binary not found at /data/data/com.termux/files/usr/bin/virgl_test_server_android - skipping start` | 环境问题（Termux 没装 virglrenderer），可修 | `container.config` 置 `enable_virgl=0`，已消除 |
+| `[!] VirGL: socket not found at /.old_root/…/.virgl_test - skipping socket bridge` | 同上，连锁行 | 同上，已消除 |
+| `[!] Hardware access disabled`（旧） | 配置问题，可修 | `enable_gpu_mode=1` 后变为 `[+] Setting up GPU-only access...` + `[GPU] Mirrored node: …`，已消除 |
+| `[!] [CGROUP] left over …` | 上次 stop 的残留，可修 | `ds_start.sh` 预清理后不再出现 |
+| `[-] [IPT] ip6tables get_table('nat') GET_INFO failed: No such file or directory` | **内核编译期硬限制**（`CONFIG_IP6_NF_NAT=n`），不能修 | 保留；代价是原生 stop 内部固定 ~5 s，见 §15 |
+| `check` 里 6 项 ✗（devtmpfs / Macvlan / IPv6 NAT / CPU limit / Process limit / Sandboxing） | **内核编译期硬限制**，不能修 | 不动，见 §15 |
+
+修复后连续 5 轮 start 的 `[!]`/`[-]` 计数：**0**。
+
+**启动慢的拆段计时（5 轮，单位 s）**
+
+| 轮 | T1 start 返回 | T2 socket 就绪 | T3 拉起 consumer | T4 fds 送达 producer | T5 plasmashell（桌面可用） |
+|---|---|---|---|---|---|
+| 1 | 0.23 | 0.30 | 0.47 | 3.05 | **3.91** |
+| 2 | 0.29 | 0.37 | 0.82 | 3.79 | **4.74** |
+| 3 | 0.24 | 0.33 | 0.80 | 3.76 | **4.31** |
+| 4 | 0.27 | 0.35 | 0.82 | 3.77 | **4.70** |
+| 5 | 0.28 | 0.36 | 0.83 | 3.72 | **4.64** |
+
+结论：容器创建/挂载/网络/GPU **0.23–0.29 s**；Anland socket 就绪 +0.07–0.08 s；
+最慢一段是 **T3→T4 的 2.2–3.0 s**，即 `com.anland.consumer` 冷启动后连 socket 并交付 5 个 fd
+（`am force-stop` → `am start` → Activity 启动 → 连接），属 Android App 冷启动成本，脚本层已无优化空间；
+T4→T5 只有 0.86–0.95 s。
+
+**修法**
+
+1. `plasma-wayland.service` 去掉 `ExecStartPre=/bin/sleep 20`（这是自伤：每次白等 20 s，期间 kwin 根本没起），
+   改 `Restart=always` + `RestartSec=2` + `KillMode=control-group` + `TimeoutStopSec=5`。
+2. `container.config`：`enable_virgl=1 → 0`（Termux 无 virglrenderer），`enable_x11` **未动**（仍为 0）。
+3. `ds_start.sh`：socket 一就绪就 `am force-stop com.anland.consumer` 再用 `--es socket_path` 拉起，
+   等 `fds delivered to producer` 与 `plasmashell`，全程分段计时。
+4. 备份：`container.config.preFix2.bak`、`plasma-wayland.service.preFix2.bak`。
+
+### 19.4 前后对照（总）
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| start → 桌面可用 | ≥20 s（`sleep 20`），且经常起不来 | **3.91–4.74 s**（5/5 成功） |
+| start 的 `[!]`/`[-]` | VirGL ×2、Hardware ×1、CGROUP ×1 | **0** |
+| stop（CLI） | **29.4 s**，留 172 个孤儿 | **2.77–3.43 s**，0 残留 |
+| stop（App / 原生） | ~30 s，kwin 孤儿持续 100% CPU | **5.20 s**，看门狗 ≤3 s 清空 |
+| stop 后 kwin_wayland | 存活，75.7–102% CPU | **不存在**（+0 s / +30 s 均为 0） |
+| stop 后 cgroup | 172 进程残留 | **0**，目录已删 |
+
+### 19.5 闭环验收（Anland 必须仍可用）
+
+```
+起容器 → 等桌面完全出来 → 长按交互 → stop → 30 s 复查
+stop 前：kwin_wayland 15.3% / plasmashell 16.4%
+stop：3.26 s，RESULT=ZERO_LEAK
++30 s：显示栈 无 / NAT 无 / veth 无 / cgroup procs 0 / ds-zap 子进程 0
+```
+
+截图：`docs/anland-desktop-r21.png`（KDE 壁纸 + 顶部面板时钟 23:11 + 托盘）、
+`docs/anland-interaction-r21.png`（长按后 Fcitx「Wayland 诊断」通知 + 底部任务栏 + 时钟 23:12 2026/11/9）。
+
+### 19.6 本轮产物 sha256
+
+```
+droid_lkm.ko（未重编，必须不变）  b710cca34249c6cf8b215b61c29ca9aa2e3be6919c9aac3123c1dabecc1603a5
+ksu/service.sh                   7920232ae0d201ddd291be6681a7cca5db713c74fc8186ec8f30935eea992e8b
+ksu/orphan_watch.sh              24bc3e8fa21f0f19029cc5b3496b0ceb0614d6ebd9dea097bc7cabf709a6d09f
+tools/ds_start.sh                1b40674cee52aa76b4d2eadfda2d91be058d2fbba93ed82a91b61c6b97ee5fa8
+tools/ds_stop.sh                 e7bae99caf6bba75ba279992e0c560aedaeaf39df38083d2d2f4cab2c3864d8d
+prebuilt/droidspaces_shim-1.1.zip c45bf93d68ff6a933614b295be294abf426d4297d147b9e99a67cc7647257bf6
+```
+
+### 19.7 仍未解决（如实记录）
+
+1. **`ip6tables nat` 缺失**（`CONFIG_IP6_NF_NAT=n`）：原生 stop 内部固定 ~5 s，脚本层无法消除；
+   要消掉只能换带该 CONFIG 的内核，超出本轮“只改脚本/配置”的边界。
+2. **`check` 剩余 6 项 ✗**：devtmpfs / Macvlan / IPv6 NAT / CPU limit / Process limit / Sandboxing，
+   全部内核编译期硬限制，判定见 §15。
+3. **`su` 域漂移**：`su -c` 偶尔落到 `u:r:shell:s0`（uid 仍是 0），此时 `droidspaces` 会
+   `can't execute: Permission denied`、`kill` 被拒。两个脚本已加 `id -u` + `attr/current` 守卫并
+   `exit 2/3`，宁可报错也不静默“成功”；重开 root 会话即可。
+4. **App 的 Stop 按钮路径** 由看门狗兜底（已用原生 `droidspaces stop` 等价验证），
+   但没有用真实手指点 App 按钮复测 —— 记录为“等价路径验证通过，未做真机点按”。
+
+### 19.8 回滚
+
+- 配置：`cp container.config.preFix2.bak container.config`；
+  `cp /etc/systemd/system/plasma-wayland.service.preFix2.bak /etc/systemd/system/plasma-wayland.service`
+- 看门狗：`kill $(pgrep -f orphan_watch.sh)`，并删 `ksu` 模块里的 `orphan_watch.sh`（或整目录 + 重启）。
+- 脚本层完全可逆，不涉及 ko / boot / 分区。
+
+### 19.9 重启次数
+
+**本轮 0 次。** 全部验证靠 `stop` + `start` 完成；ko 未动，模块文件用 `cp` 直接落到
+`/data/adb/modules/droidspaces_shim/` 并手动 `nohup` 起看门狗（免重启生效）。
+累计仍为 **28 次**（§17）。
+
 ## License
 
 GPL-2.0（随上游 `Dere3046/_patchHarmony`）。本仓库的修改同样以 GPL-2.0 发布。
