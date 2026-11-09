@@ -1326,6 +1326,84 @@ chmod 755 service.sh orphan_watch.sh
 **恢复时不要做的事**：容器运行中不要直接覆盖 `/data/adb/modules/…/droid_lkm.ko`
 （正在加载的 ko 被替换会让 `rmmod` 与校验对不上）；先 `stop` 容器，替换，再重启。
 
+## 21. 重启后一条命令就位（bringup）
+
+### 21.1 为什么需要
+
+本机 KSU 是 LKM 形态（`kernelsu.ko` 不随开机加载）。重启后：`kernelsu.ko` 不在 →
+`/data/adb/modules/*/service.sh` 不会被触发 → `orphan_watch.sh` 也不会自己起来。
+所以需要一条命令把整条链拉起来：
+
+```
+late-load kernelsu.ko → 模块 service.sh（校验内核/ko sha 后 insmod droid_lkm）
+                     → 起 orphan_watch.sh 看门狗 → droidspaces check
+```
+
+### 21.2 老板要做的（3 步）
+
+1. 开机后打开 KernelSU 管理器，点一次授权，拿到临时 root。
+2. 任意终端（Termux / adb）执行 **一条命令**（不必先 `su`）：
+
+   ```sh
+   sh /data/local/tmp/bringup.sh
+   ```
+
+   看到最后一行 `READY` 即就位；输出含 `droid_lkm ... Live`、看门狗 PID、check 结果。
+3. 正常使用：起容器 → Anland 出桌面。
+
+说明文件也在设备上：`/data/local/tmp/README-REBOOT.txt`（同一份在模块目录里）。
+
+### 21.3 脚本做了什么（幂等，可反复跑）
+
+| 阶段 | 动作 | 说明 |
+|---|---|---|
+| `late` | `/data/local/tmp/libksud.so late-load --allow-shell --package-name me.weishu.kernelsu` | 已加载则跳过；late-load 会让**当前** su 会话掉权，所以脚本用两次独立 `su` |
+| `boot` | `ksud feature set su_compat 1`（仅当为 0）→ `模块/service.sh` → 校验 `droid_lkm` Live → 起看门狗 → `droidspaces check` | 每步失败都有明确 FAIL 行，不静默 |
+
+排障可分段执行：`su -c 'sh /data/local/tmp/bringup.sh late'`、`... boot`。
+日志：`/data/local/tmp/bringup.log`、`/data/adb/droidspaces_shim.log`。
+
+另外 `/data/adb/service.d/droidspaces_shim.sh` 已改为**委托**模块 `service.sh`（不再复制一份 insmod 逻辑），
+这样万一某次开机 KSU 正常跑了 service.d，也会自动就位；两条路径行为一致、不会各改各的。
+
+旧的 `/data/local/tmp/ksu_bringup.sh` 保留为一行转发（`exec sh bringup.sh "$@"`），旧习惯仍可用。
+
+### 21.4 运行态文件与仓库对齐（实测 sha256）
+
+| 文件 | 设备路径 | 设备 sha256 | 仓库 | 结论 |
+|---|---|---|---|---|
+| module.prop | `/data/adb/modules/droidspaces_shim/module.prop` | `829b4a35…` | `ksu/module.prop` | 一致 |
+| service.sh | 同上 | `7920232a…` | `ksu/service.sh` | 一致 |
+| orphan_watch.sh | 同上 | `24bc3e8f…` | `ksu/orphan_watch.sh` | 一致 |
+| droid_lkm.ko | 同上 | `b710cca3…603a5` | `prebuilt/droid_lkm.ko` | 一致（未替换） |
+| ds_start.sh | `/data/local/tmp/ds_start.sh` | `1b40674c…` | `tools/ds_start.sh` | 一致 |
+| ds_stop.sh | `/data/local/tmp/ds_stop.sh` | `e7bae99c…` | `tools/ds_stop.sh` | 一致 |
+| container.config | `/data/local/Droidspaces/Containers/UBUNTU26/container.config` | 内容比对 | — | `enable_virgl=0` / `enable_x11=0` / `enable_gpu_mode=1` / `enable_anland=1` / `net_mode=nat` / `disable_ipv6=1`，符合 |
+| plasma-wayland.service | `/data/local/Droidspaces/rootfs/UBUNTU26/etc/systemd/system/plasma-wayland.service` | `ba7ef0cd…` | — | 无 `sleep 20`、有 `Restart=always` / `RestartSec=2` / `KillMode=control-group` / `TimeoutStopSec=5`，符合 |
+
+本轮修正的不一致项：`/data/adb/service.d/droidspaces_shim.sh`（旧版自己 insmod、不拉看门狗）→ 改为委托；
+`/data/local/tmp/ksu_bringup.sh`（旧版）→ 一行转发到 `bringup.sh`。
+
+### 21.5 本次验证（当前开机，未重启）
+
+```
+sh /data/local/tmp/bringup.sh
+  su_compat=1
+  module service.sh rc=0
+  droid_lkm: droid_lkm 786432 1 - Live 0x0000000000000000 (O)
+  看门狗: 22558 sh /data/adb/modules/droidspaces_shim/orphan_watch.sh
+  check: All required features found
+  READY
+
+start：T1 0.26s / T2 0.34s / T3 0.51s / T4 3.10s / T5 3.63s（桌面可用 3.74s）
+stop ：3.37s，RESULT=ZERO_LEAK
++0s ：kwin=0 plasma=0 cgroup_procs=0
++30s：kwin=0 plasma=0 cgroup=0 nat_rules=0 running=0
+```
+
+**踩到并记录的坑**：屏幕熄灭时 `am start` 拉起 Anland consumer 会被系统延迟，
+实测 T3→T4 从 3 s 涨到 **49 s**（截图全黑）。所以 `ds_start.sh` 的耗时必须在**亮屏**状态下测；
+老板实际使用是亮屏点开，不受影响。
 ## License
 
 GPL-2.0（随上游 `Dere3046/_patchHarmony`）。本仓库的修改同样以 GPL-2.0 发布。
