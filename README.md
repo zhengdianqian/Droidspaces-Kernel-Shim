@@ -1326,34 +1326,57 @@ chmod 755 service.sh orphan_watch.sh
 **恢复时不要做的事**：容器运行中不要直接覆盖 `/data/adb/modules/…/droid_lkm.ko`
 （正在加载的 ko 被替换会让 `rmmod` 与校验对不上）；先 `stop` 容器，替换，再重启。
 
-## 21. 重启后一条命令就位（bringup）
+## 21. 重启后怎么就位（先把旧说法纠正掉）
 
-### 21.1 为什么需要
+### 21.1 纠正：**不需要跑任何脚本**
 
-本机 KSU 是 LKM 形态（`kernelsu.ko` 不随开机加载）。重启后：`kernelsu.ko` 不在 →
-`/data/adb/modules/*/service.sh` 不会被触发 → `orphan_watch.sh` 也不会自己起来。
-所以需要一条命令把整条链拉起来：
+旧版本这里写的是"必须跑一条命令 `sh /data/local/tmp/bringup.sh`"，**这是错的**，本轮实测已推翻：
+
+- 老板重启设备后，只在 KernelSU 管理器里点了一次授权（拿到临时 root），**一条脚本都没跑**；
+- Droidspaces 照常可用，而且启动更快（少了脚本里的等待）。
+
+实证时间线（`/data/adb/droidspaces_shim.log`，设备 uptime 1017 s ≈ 23:42:40 开机）：
 
 ```
-late-load kernelsu.ko → 模块 service.sh（校验内核/ko sha 后 insmod droid_lkm）
-                     → 起 orphan_watch.sh 看门狗 → droidspaces check
+23:43:55  [service.d] service.d script started
+23:43:55  [service] service.sh started (ko=/data/adb/modules/droidspaces_shim/droid_lkm.ko)
+23:43:55  [service] checks passed (kernel=5.10.236-... sha256=b710cca3...)
+23:44:00  [service] insmod rc=0
+23:44:00  [service] loaded: droid_lkm 786432 1 - Live 0x0000000000000000 (O)
+23:44:00  [service.d] delegate rc=0
+23:44:00  [service] orphan_watch supervisor started pid=14561
 ```
 
-### 21.2 老板要做的（3 步）
+同一时刻 `/data/local/tmp/bringup.log` 的最后一条还是 23:36 手动跑的那次 `READY`，
+即这次开机**没有任何脚本被执行**。`/proc/modules` 里 `kernelsu` 与 `droid_lkm` 同为 `Live`。
+
+结论（KSU LKM 形态的真实行为）：
+
+```
+App 里拿临时 root → 触发 kernelsu.ko late-load
+                   → KSU 进入开机脚本阶段，同时执行
+                       (a) /data/adb/modules/droidspaces_shim/service.sh
+                       (b) /data/adb/service.d/droidspaces_shim.sh（委托给 (a)）
+                   → insmod droid_lkm → 起 orphan_watch 看门狗
+```
+
+所以 `bringup.sh` 从"必须步骤"降级为**兜底工具**：只有当模块没被 KSU 触发（比如模块目录被删、
+或某次开机 KSU 没进开机脚本阶段）时才需要手动跑一次。判断方法：看
+`/data/adb/droidspaces_shim.log` 有没有本次开机的 `insmod rc=0`，或 `grep droid_lkm /proc/modules`。
+
+### 21.2 老板实际要做的
 
 1. 开机后打开 KernelSU 管理器，点一次授权，拿到临时 root。
-2. 任意终端（Termux / adb）执行 **一条命令**（不必先 `su`）：
+2. 直接用 Droidspaces（起容器 → Anland 出桌面）。
+3. 停止：App 点 Stop 或 `ds_stop.sh` 都可以，残留由看门狗自动处理，**不需要手动查进程**。
 
-   ```sh
-   sh /data/local/tmp/bringup.sh
-   ```
+只有在 `grep droid_lkm /proc/modules` 为空时才需要兜底：
 
-   看到最后一行 `READY` 即就位；输出含 `droid_lkm ... Live`、看门狗 PID、check 结果。
-3. 正常使用：起容器 → Anland 出桌面。
+```sh
+sh /data/local/tmp/bringup.sh      # 幂等；最后一行 READY 即就位
+```
 
-说明文件也在设备上：`/data/local/tmp/README-REBOOT.txt`（同一份在模块目录里）。
-
-### 21.3 脚本做了什么（幂等，可反复跑）
+### 21.3 bringup.sh 做了什么（幂等，可反复跑）
 
 | 阶段 | 动作 | 说明 |
 |---|---|---|
@@ -1363,47 +1386,95 @@ late-load kernelsu.ko → 模块 service.sh（校验内核/ko sha 后 insmod dro
 排障可分段执行：`su -c 'sh /data/local/tmp/bringup.sh late'`、`... boot`。
 日志：`/data/local/tmp/bringup.log`、`/data/adb/droidspaces_shim.log`。
 
-另外 `/data/adb/service.d/droidspaces_shim.sh` 已改为**委托**模块 `service.sh`（不再复制一份 insmod 逻辑），
-这样万一某次开机 KSU 正常跑了 service.d，也会自动就位；两条路径行为一致、不会各改各的。
+`/data/adb/service.d/droidspaces_shim.sh` 只做**委托**（`sh "$M/service.sh"`），不复制 insmod 逻辑，
+两条触发路径行为一致。
 
-旧的 `/data/local/tmp/ksu_bringup.sh` 保留为一行转发（`exec sh bringup.sh "$@"`），旧习惯仍可用。
+旧的 `/data/local/tmp/ksu_bringup.sh` 保留为一行转发（`exec sh bringup.sh "$@"`）。
 
 ### 21.4 运行态文件与仓库对齐（实测 sha256）
 
 | 文件 | 设备路径 | 设备 sha256 | 仓库 | 结论 |
 |---|---|---|---|---|
 | module.prop | `/data/adb/modules/droidspaces_shim/module.prop` | `829b4a35…` | `ksu/module.prop` | 一致 |
-| service.sh | 同上 | `7920232a…` | `ksu/service.sh` | 一致 |
-| orphan_watch.sh | 同上 | `24bc3e8f…` | `ksu/orphan_watch.sh` | 一致 |
+| service.sh | 同上 | `7ea6d783…` | `ksu/service.sh` | 一致（v3 看门狗版） |
+| orphan_watch.sh | 同上 | `c36047fa…` | `ksu/orphan_watch.sh` | 一致（v3） |
 | droid_lkm.ko | 同上 | `b710cca3…603a5` | `prebuilt/droid_lkm.ko` | 一致（未替换） |
 | ds_start.sh | `/data/local/tmp/ds_start.sh` | `1b40674c…` | `tools/ds_start.sh` | 一致 |
 | ds_stop.sh | `/data/local/tmp/ds_stop.sh` | `e7bae99c…` | `tools/ds_stop.sh` | 一致 |
 | container.config | `/data/local/Droidspaces/Containers/UBUNTU26/container.config` | 内容比对 | — | `enable_virgl=0` / `enable_x11=0` / `enable_gpu_mode=1` / `enable_anland=1` / `net_mode=nat` / `disable_ipv6=1`，符合 |
 | plasma-wayland.service | `/data/local/Droidspaces/rootfs/UBUNTU26/etc/systemd/system/plasma-wayland.service` | `ba7ef0cd…` | — | 无 `sleep 20`、有 `Restart=always` / `RestartSec=2` / `KillMode=control-group` / `TimeoutStopSec=5`，符合 |
 
-本轮修正的不一致项：`/data/adb/service.d/droidspaces_shim.sh`（旧版自己 insmod、不拉看门狗）→ 改为委托；
-`/data/local/tmp/ksu_bringup.sh`（旧版）→ 一行转发到 `bringup.sh`。
-
-### 21.5 本次验证（当前开机，未重启）
-
-```
-sh /data/local/tmp/bringup.sh
-  su_compat=1
-  module service.sh rc=0
-  droid_lkm: droid_lkm 786432 1 - Live 0x0000000000000000 (O)
-  看门狗: 22558 sh /data/adb/modules/droidspaces_shim/orphan_watch.sh
-  check: All required features found
-  READY
-
-start：T1 0.26s / T2 0.34s / T3 0.51s / T4 3.10s / T5 3.63s（桌面可用 3.74s）
-stop ：3.37s，RESULT=ZERO_LEAK
-+0s ：kwin=0 plasma=0 cgroup_procs=0
-+30s：kwin=0 plasma=0 cgroup=0 nat_rules=0 running=0
-```
-
 **踩到并记录的坑**：屏幕熄灭时 `am start` 拉起 Anland consumer 会被系统延迟，
 实测 T3→T4 从 3 s 涨到 **49 s**（截图全黑）。所以 `ds_start.sh` 的耗时必须在**亮屏**状态下测；
 老板实际使用是亮屏点开，不受影响。
+
+## 22. 首次 stop 慢 + kwin 残留：定位与根治（v3 看门狗）
+
+### 22.1 现象与规律
+
+老板实测规律：**stop 3 s 内退出 → 基本无 kwin 残留；退很久 → 大概率有 kwin**。
+本轮数据证明因果方向是反的：**不是"退得慢所以残留"，而是"有残留所以退得慢"**。
+
+### 22.2 为什么慢（容器日志 + 0.1 s 时序探针）
+
+原生 stop（App 点 Stop 走的就是这条）在容器日志（UTC）里的分段：
+
+```
+16:09:19.497  Stopping container 'UBUNTU26' (PID 28113)...
+16:09:19.510  Detected container SHUTDOWN (exit: 1)      ← init 只用了 13 ms 就被杀掉
+16:09:20.089  [NET] Uplink route monitor stopped          ┐
+16:09:20.139  [Anland] terminating                         │ 网络/Anland/iptables 全部拆完
+16:09:20.544  [IPT] ip6tables GET_INFO failed              ┘ 只花 1.05 s
+16:09:27.866  Container 'UBUNTU26' stopped.                ← 之后 7.3 s 全在等 pidns 排空
+```
+
+即：**stop 的 8.36 s 里只有 1.05 s 是真活，7.3 s 在等容器残留进程退出**。因为
+`CONFIG_PID_NS=n` + `no_teardown=1`，内核不会回收该 pidns 的其它进程，`droidspaces stop`
+只能轮询等它排空，排不空就一直等。旧看门狗（v2）在这台机器上检测+清理要 3~6 s，
+所以总时长落在 5.7~8.7 s，期间 `kwin_wayland` 被 `ds-zap` 收养、挂在 Anland socket 上空转。
+
+v2 慢的两个具体原因（实测）：
+
+| 原因 | 实测值 |
+|---|---|
+| `find … -exec cat {} \;` 逐个读 53 个 `cgroup.procs` | **1.30 s / 次**，而排空循环每次要读 2 遍 |
+| 1 s 轮询 + 1 s 去抖 + 无 init 缓存，每次都要全树重扫 | 检测延迟 1~6 s |
+
+第二次 stop 快，是因为第一次已经把这些进程清掉了，cgroup 空 → stop 立刻返回，
+并不是"第二次有什么特殊路径"。所以**只要保证第一次就一定清干净，两次都会快**。
+
+### 22.3 v3 看门狗（当前设备在跑）
+
+1. **事件驱动**：缓存每个容器 cgroup 的 PID1；正常运行时每 0.3 s 只做
+   `is_init $pid`（一次 `/proc/<pid>/comm`），开销近零；PID1 一消失立即进入排空，
+   检测延迟 ≤ 0.3 s（实测 0.4~0.6 s）。
+2. **批量枚举**：`find -print0 | xargs -0 cat`，53 个文件 1.30 s → **0.08 s**。
+3. **排空循环**：`列进程 → kill -9 → 0.1 s → 复验`，最多 20 轮 × 3 外层轮，直到
+   `procs=0` 且目录已删；每轮结果写日志，不静默放过。
+4. **确定性校验**：排空后立刻校验 `/droidspaces` cgroup 下的
+   `kwin_wayland / kwin_wayland_wrapper / plasmashell / startplasma* / konsole / Xwayland /
+   kded5 / kactivitymanagerd / dbus-daemon / dbus-broker` 以及 `ds-zap` 收养链是否全为 0，
+   不达标再杀，最多 3 轮，最后一轮仍失败会写 `VERIFY FAIL`。
+5. **空闲校验**：没有任何容器持有 init 时，每 10 s 再校验一次（覆盖"cgroup 目录已被
+   droidspaces 提前删掉、看门狗看不见"的场景）。
+6. **自恢复**：`service.sh` 用 supervisor 循环托管看门狗，且 supervisor 的 cmdline 里
+   **刻意不出现脚本文件名**（用 `env WD=` 传参），这样 `pkill -f orphan_watch.sh` 只杀子进程，
+   supervisor 会在 2 s 内把它拉起来。
+
+### 22.4 实测（当前开机，非重启后）
+
+| 场景 | stop 总耗时 | kwin | cgroup 进程 | cgroup 目录 |
+|---|---|---|---|---|
+| 原生 stop #1 | 1.23 s | 0 | 0 | 已删 |
+| 原生 stop #2 | 1.30 s | 0 | 0 | 已删 |
+| 原生 stop #3 | 1.46 s | 0 | 0 | 已删 |
+| 原生 stop #4 | 1.52 s | 0 | 0 | 已删 |
+| 原生 stop #5 | 1.36 s | 0 | 0 | 已删 |
+| 原生 stop（时序探针） | 2.06 s / 1.48 s | 0 | 0 | 已删 |
+| 脚本 stop（`ds_stop.sh`） | 3.42 s | 0 | 0 | 已删，`RESULT=ZERO_LEAK` |
+
+自恢复：`pkill -f orphan_watch.sh` 后 3 s 内子进程恢复为 1。
+
 ## License
 
 GPL-2.0（随上游 `Dere3046/_patchHarmony`）。本仓库的修改同样以 GPL-2.0 发布。
