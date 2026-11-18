@@ -1543,6 +1543,74 @@ Anland 全流程：起容器（T5 = 3.7 s 桌面可用）→ 截图确认桌面/
 - 仍存在的硬限制（不在本仓库可修范围）：`CONFIG_PID_NS=n` 导致必须靠外部看门狗回收；
   6 项内核 CONFIG 缺失（见第 15 节）；`su` 域偶发漂移到 `u:r:shell:s0`（脚本已加守卫）。
 
+## 23. Release 下载（最省事的刷入方式）
+
+不想自己打包的人直接下这个 Release（2026-11-10 发布，已做远端回取校验）：
+
+**<https://github.com/zhengdianqian/Droidspaces-Kernel-Shim/releases/tag/v1.1>**
+
+| 附件 | 用途 | 字节数 | sha256 |
+|---|---|---|---|
+| `droidspaces_shim-1.1.zip` | **刷这个**（KSU 模块包，`module.prop` 在 zip 根） | 2413736 | `c489bf5c947229fcfaf81660eeba684325d601df156af01d7bff93ad0e6d28b4` |
+| `droid_lkm_B18.ko` | 内核模块本体，仅留档/校验用 | 10086568 | `b710cca34249c6cf8b215b61c29ca9aa2e3be6919c9aac3123c1dabecc1603a5` |
+
+直接下载地址（不需要 git clone）：
+
+```sh
+curl -fL -O https://github.com/zhengdianqian/Droidspaces-Kernel-Shim/releases/download/v1.1/droidspaces_shim-1.1.zip
+```
+
+### 23.1 自己校验一遍（必须做）
+
+```sh
+curl -fL -o droidspaces_shim-1.1.zip \
+  https://github.com/zhengdianqian/Droidspaces-Kernel-Shim/releases/download/v1.1/droidspaces_shim-1.1.zip
+sha256sum droidspaces_shim-1.1.zip
+# 必须输出 c489bf5c947229fcfaf81660eeba684325d601df156af01d7bff93ad0e6d28b4
+```
+
+本轮实测的回取结果（不是"上传成功"就算）：
+
+```
+--- droidspaces_shim-1.1.zip ---
+http_code=200 size_download=2413736
+--- droid_lkm_B18.ko ---
+http_code=200 size_download=10086568
+
+远端回取 c489bf5c…d28b4  rb_droidspaces_shim-1.1.zip   2413736
+远端回取 b710cca3…603a5  rb_droid_lkm_B18.ko        10086568
+本地原始 c489bf5c…d28b4  prebuilt/droidspaces_shim-1.1.zip 2413736
+本地原始 b710cca3…603a5  prebuilt/droid_lkm_B18.ko       10086568
+cmp zip: IDENTICAL      cmp ko: IDENTICAL
+远端 zip 内 droid_lkm.ko sha256: b710cca3…603a5
+```
+
+（`cmp` 是逐字节比对，比 sha256 更强；zip 内的 ko 也单独校验过，排除"上传后被重新打包"。）
+
+### 23.2 刷入步骤
+
+1. KernelSU 管理器 → 模块 → **从本地安装**，选 `droidspaces_shim-1.1.zip`；
+2. 重启；
+3. **重启后要在 KSU 管理器里手点一次拿临时 root**（点"未安装 / 点击安装"卡片，
+   **不要**走刷写 boot 镜像那条路）；
+4. 拿到 root 后链路自动完成：`/data/adb/service.d/droidspaces_shim.sh` → 模块 `service.sh`
+   → `insmod droid_lkm` → 起 `orphan_watch` 看门狗。**不需要跑任何脚本**（§21）。
+
+验证：
+
+```sh
+su -c 'grep droid_lkm /proc/modules'        # 要能看到 Live
+su -c 'tail -20 /data/adb/droidspaces_watchdog.log'
+```
+
+关闭：删 `/data/adb/modules/droidspaces_shim` 后重启。
+
+### 23.3 与仓库内 `prebuilt/` 的关系
+
+Release 的两份附件就是仓库 `prebuilt/` 里的同名文件（逐字节一致）。仓库里另有
+`prebuilt/droid_lkm_B18.ko`，与 zip 内的 `droid_lkm.ko` 同 sha256 `b710cca3…603a5`。
+**不要替换这个 ko**：它是唯一与本机内核对齐的版本（§16）。
+
 ## License
 
 GPL-2.0（随上游 `Dere3046/_patchHarmony`）。本仓库的修改同样以 GPL-2.0 发布。
